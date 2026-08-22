@@ -7,109 +7,103 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-let cachedRates = null;
-let lastFetch = 0;
-const CACHE_TTL = 10 * 60 * 1000; // 10 минут
-
 async function fetchAllRates() {
-    console.log('🔄 Загрузка курсов из Telegram...');
+    console.log('🔄 Загрузка свежих курсов из Telegram @LoyaltySwift...');
     
     try {
         const response = await fetch('https://t.me/s/LoyaltySwift', {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-                'Accept-Language': 'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
             }
         });
         
-        if (!response.ok) {
-            throw new Error(`HTTP ошибка: ${response.status} ${response.statusText}`);
-        }
-        
+        if (!response.ok) throw new Error(`HTTP ошибка: ${response.status}`);
         const html = await response.text();
 
-        // Парсим курсы через регулярные выражения
-        const rates = {};
+        // Убираем лишние пробеги
+        const text = html.replace(/\s+/g, ' ');
 
-        // --- JPY ---
-        const jpyMatch = html.match(/ЯПОНИЯ[^\d]*(\d+[.,]\d+)/i);
-        if (jpyMatch) {
-            const val = parseFloat(jpyMatch[1].replace(',', '.'));
-            rates.JPY = val / 100;
+        console.log('📄 Поиск курсов в тексте...');
+
+        // --- Функция для поиска курса по паттерну ---
+        function findRate(pattern) {
+            const regex = new RegExp(pattern, 'i');
+            const match = text.match(regex);
+            if (match) {
+                const val = parseFloat(match[1].replace(',', '.'));
+                return val;
+            }
+            return null;
         }
 
-        const afaMatch = html.match(/AFA\s*TRADING[^\d]*(\d+[.,]\d+)/i);
-        if (afaMatch) {
-            const val = parseFloat(afaMatch[1].replace(',', '.'));
-            rates.JPY_AFA = val / 100;
-        }
+        // --- Парсим все курсы ---
 
-        const qrMatch = html.match(/QR[-\s]?code[^\d]*(\d+[.,]\d+)/i);
-        if (qrMatch) {
-            const val = parseFloat(qrMatch[1].replace(',', '.'));
-            rates.JPY_QR = val / 100;
-        }
+        // 1. USD SWIFT
+        let usd = findRate('SWIFT[^\\d]*?(\\d+[.,]\\d+)');
+        if (!usd) usd = findRate('USD[^\\d]*?=\\s*(\\d+[.,]\\d+)');
+        
+        // 2. USD IDUBID
+        let usdIdubid = findRate('IDUBID[^\\d]*?(\\d+[.,]\\d+)');
+        
+        // 3. CNY
+        let cny = findRate('КИТАЙ[^\\d]*?(\\d+[.,]\\d+)');
+        
+        // 4. JPY (внутренний перевод)
+        let jpyInternal = findRate('ЯПОНИЯ[^\\d]*?внутренний[^\\d]*?(\\d+[.,]\\d+)');
+        if (!jpyInternal) jpyInternal = findRate('внутренний[^\\d]*?(\\d+[.,]\\d+)');
+        
+        // 5. JPY (SWIFT)
+        let jpySwift = findRate('ЯПОНИЯ[^\\d]*?SWIFT[^\\d]*?(\\d+[.,]\\d+)');
+        if (!jpySwift) jpySwift = findRate('SWIFT[^\\d]*?(\\d+[.,]\\d+)');
+        
+        // 6. JPY AFA (наличные)
+        let jpyAfa = findRate('AFA[^\\d]*?TRADING[^\\d]*?наличные[^\\d]*?(\\d+[.,]\\d+)');
+        if (!jpyAfa) jpyAfa = findRate('AFA[^\\d]*?TRADING[^\\d]*?(\\d+[.,]\\d+)');
+        
+        // 7. JPY AFA (QR)
+        let jpyQr = findRate('AFA[^\\d]*?TRADING[^\\d]*?QR[^\\d]*?(\\d+[.,]\\d+)');
+        if (!jpyQr) jpyQr = findRate('QR[^\\d]*?code[^\\d]*?(\\d+[.,]\\d+)');
+        
+        // 8. KRW
+        let krw = findRate('КОРЕЯ[^\\d]*?(\\d+[.,]\\d+)');
+        if (!krw) krw = findRate('KRW[^\\d]*?(\\d+[.,]\\d+)');
+        
+        // 9. AED
+        let aed = findRate('АОЗ[^\\d]*?(\\d+[.,]\\d+)');
+        if (!aed) aed = findRate('AED[^\\d]*?(\\d+[.,]\\d+)');
+        
+        // 10. THB
+        let thb = findRate('ТАИЛАНД[^\\d]*?(\\d+[.,]\\d+)');
+        if (!thb) thb = findRate('THB[^\\d]*?(\\d+[.,]\\d+)');
 
-        // --- USD ---
-        const usdMatch = html.match(/SWIFT[^\d]*(\d+[.,]\d+)/i);
-        if (usdMatch) {
-            rates.USD = parseFloat(usdMatch[1].replace(',', '.'));
-        }
-
-        const idubidMatch = html.match(/IDUBID[^\d]*(\d+[.,]\d+)/i);
-        if (idubidMatch) {
-            rates.USD_IDUBID = parseFloat(idubidMatch[1].replace(',', '.'));
-        }
-
-        // --- CNY ---
-        const cnyMatch = html.match(/КИТАЙ[^\d]*(\d+[.,]\d+)/i);
-        if (cnyMatch) {
-            rates.CNY = parseFloat(cnyMatch[1].replace(',', '.'));
-        }
-
-        // --- KRW ---
-        const krwMatch = html.match(/(?:1000\s*KRW|ЮЖНАЯ\s*КОРЕЯ)[^\d]*(\d+[.,]\d+)/i);
-        if (krwMatch) {
-            const val = parseFloat(krwMatch[1].replace(',', '.'));
-            rates.KRW = val / 1000;
-        }
-
-        // --- AED ---
-        const aedMatch = html.match(/АОЗ[^\d]*(\d+[.,]\d+)/i);
-        if (aedMatch) {
-            rates.AED = parseFloat(aedMatch[1].replace(',', '.'));
-        }
-
-        // --- THB ---
-        const thbMatch = html.match(/ТАИЛАНД[^\d]*(\d+[.,]\d+)/i);
-        if (thbMatch) {
-            rates.THB = parseFloat(thbMatch[1].replace(',', '.'));
-        }
-
-        // Резервные значения (если что-то не найдётся)
+        // --- Если какой-то курс не найден, используем резерв ---
         const fallback = {
-            JPY: 0.5540,
-            JPY_AFA: 0.5600,
-            JPY_QR: 0.5540,
-            USD: 87.80,
-            USD_IDUBID: 89.30,
-            CNY: 13.30,
-            KRW: 0.0622,
-            AED: 22.90,
+            USD: 87.60,
+            USD_IDUBID: 89.00,
+            CNY: 13.10,
+            JPY: 0.5550,
+            JPY_SWIFT: 0.5550,
+            JPY_AFA: 0.5610,
+            JPY_QR: 0.5550,
+            KRW: 0.0637,
+            AED: 23.50,
             THB: 2.69
         };
 
-        for (const key of Object.keys(fallback)) {
-            if (rates[key] === undefined || rates[key] === null) {
-                rates[key] = fallback[key];
-            }
-        }
+        const rates = {
+            USD: usd || fallback.USD,
+            USD_IDUBID: usdIdubid || fallback.USD_IDUBID,
+            CNY: cny || fallback.CNY,
+            JPY: jpyInternal ? jpyInternal / 100 : fallback.JPY,
+            JPY_SWIFT: jpySwift ? jpySwift / 100 : fallback.JPY_SWIFT,
+            JPY_AFA: jpyAfa ? jpyAfa / 100 : fallback.JPY_AFA,
+            JPY_QR: jpyQr ? jpyQr / 100 : fallback.JPY_QR,
+            KRW: krw ? krw / 1000 : fallback.KRW,
+            AED: aed || fallback.AED,
+            THB: thb || fallback.THB
+        };
 
-        console.log('✅ Курсы получены:', rates);
+        console.log('✅ Свежие курсы из Telegram:', rates);
         return rates;
 
     } catch (error) {
@@ -118,27 +112,29 @@ async function fetchAllRates() {
     }
 }
 
+// --- Эндпоинт для получения курсов (всегда свежие) ---
 app.get('/api/rates', async (req, res) => {
     try {
-        const now = Date.now();
-        if (cachedRates && (now - lastFetch) < CACHE_TTL) {
-            return res.json({ rates: cachedRates, source: 'cache' });
-        }
+        // Всегда парсим свежие курсы, без кеша!
         const rates = await fetchAllRates();
-        cachedRates = rates;
-        lastFetch = now;
-        res.json({ rates, source: 'fresh' });
+        res.json({ rates, source: 'fresh', updated: new Date().toISOString() });
     } catch (error) {
         console.error('❌ Ошибка:', error.message);
-        if (cachedRates) {
-            res.json({ rates: cachedRates, source: 'stale' });
-        } else {
-            res.status(500).json({ error: error.message });
-        }
+        res.status(500).json({ error: error.message });
     }
 });
 
+// --- Корневой путь ---
+app.get('/', (req, res) => {
+    res.send(`
+        <h1>🚀 Сервер курсов работает!</h1>
+        <p>Курсы всегда свежие из <a href="https://t.me/s/LoyaltySwift" target="_blank">@LoyaltySwift</a></p>
+        <p>При каждом запросе парсится Telegram</p>
+        <p><a href="/api/rates">/api/rates</a> - получить курсы в JSON</p>
+    `);
+});
+
 app.listen(PORT, () => {
-    console.log(`🚀 Сервер запущен на http://localhost:${PORT}`);
-    console.log(`📊 Проверка: http://localhost:${PORT}/api/rates`);
+    console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log(`📊 Каждый запрос к /api/rates даёт свежие курсы из Telegram`);
 });
