@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: loyaltyswift-rates
+    runtime: node
+    plan: free
+
+    buildCommand: npm install
+    startCommand: npm start
+
+    envVars:
+      - key: NODE_VERSION
+        value: 20.19.0
+
+    healthCheckPath: /health
