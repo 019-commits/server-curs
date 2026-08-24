@@ -12,40 +12,70 @@ app.use(express.json());
 
 let cachedRates = null;
 let lastFetch = 0;
-const CACHE_TTL = 5 * 60 * 1000; // 5 минут
+const CACHE_TTL = 2 * 60 * 1000; // 2 минуты
 
 // --- Функция для извлечения курсов из распознанного текста ---
 function extractRatesFromText(text) {
-    console.log('📄 Распознанный текст:', text);
+    console.log('📄 Распознанный текст (первые 500 символов):', text.substring(0, 500));
     
     const rates = {};
     
-    // Ищем курсы по ключевым словам
-    const patterns = {
-        USD: /USD[^\d]*?(\d+[.,]\d+)/i,
-        USD_IDUBID: /IDUBID[^\d]*?(\d+[.,]\d+)/i,
-        CNY: /КИТАЙ[^\d]*?(\d+[.,]\d+)/i,
-        JPY: /ЯПОНИЯ[^\d]*?(\d+[.,]\d+)/i,
-        JPY_SWIFT: /SWIFT[^\d]*?(\d+[.,]\d+)/i,
-        JPY_AFA: /AFA[^\d]*?TRADING[^\d]*?(\d+[.,]\d+)/i,
-        JPY_QR: /QR[^\d]*?code[^\d]*?(\d+[.,]\d+)/i,
-        KRW: /КОРЕЯ[^\d]*?(\d+[.,]\d+)/i,
-        AED: /АОЗ[^\d]*?(\d+[.,]\d+)/i,
-        THB: /ТАИЛАНД[^\d]*?(\d+[.,]\d+)/i
-    };
+    // Проверяем, что это картинка с курсами
+    if (!text.includes('КУРС') && !text.includes('JPY') && !text.includes('USD')) {
+        console.log('⚠️ Это не картинка с курсами');
+        return null;
+    }
     
-    for (const [key, pattern] of Object.entries(patterns)) {
-        const match = text.match(pattern);
-        if (match) {
-            let val = parseFloat(match[1].replace(',', '.'));
-            // Корректируем значения
-            if (key === 'JPY' && val > 10) val = val / 100;
-            if (key === 'JPY_SWIFT' && val > 10) val = val / 100;
-            if (key === 'JPY_AFA' && val > 10) val = val / 100;
-            if (key === 'JPY_QR' && val > 10) val = val / 100;
-            if (key === 'KRW' && val > 10) val = val / 1000;
-            rates[key] = val;
-        }
+    // --- Ищем курсы ---
+    let usdMatch = text.match(/USD[^\d]*?(\d+[.,]\d+)/i);
+    if (usdMatch) rates.USD = parseFloat(usdMatch[1].replace(',', '.'));
+    
+    let idubidMatch = text.match(/IDUBID[^\d]*?(\d+[.,]\d+)/i);
+    if (idubidMatch) rates.USD_IDUBID = parseFloat(idubidMatch[1].replace(',', '.'));
+    
+    let cnyMatch = text.match(/КИТАЙ[^\d]*?(\d+[.,]\d+)/i);
+    if (cnyMatch) rates.CNY = parseFloat(cnyMatch[1].replace(',', '.'));
+    
+    let jpyMatch = text.match(/ЯПОНИЯ[^\d]*?внутренний[^\d]*?(\d+[.,]\d+)/i);
+    if (jpyMatch) {
+        let val = parseFloat(jpyMatch[1].replace(',', '.'));
+        rates.JPY = val / 100;
+    }
+    
+    let jpySwiftMatch = text.match(/ЯПОНИЯ[^\d]*?SWIFT[^\d]*?(\d+[.,]\d+)/i);
+    if (jpySwiftMatch) {
+        let val = parseFloat(jpySwiftMatch[1].replace(',', '.'));
+        rates.JPY_SWIFT = val / 100;
+    }
+    
+    let afaMatch = text.match(/AFA[^\d]*?TRADING[^\d]*?наличные[^\d]*?(\d+[.,]\d+)/i);
+    if (afaMatch) {
+        let val = parseFloat(afaMatch[1].replace(',', '.'));
+        rates.JPY_AFA = val / 100;
+    }
+    
+    let qrMatch = text.match(/AFA[^\d]*?TRADING[^\d]*?QR[^\d]*?(\d+[.,]\d+)/i);
+    if (qrMatch) {
+        let val = parseFloat(qrMatch[1].replace(',', '.'));
+        rates.JPY_QR = val / 100;
+    }
+    
+    let krwMatch = text.match(/ЮЖНАЯ[^\d]*?КОРЕЯ[^\d]*?(\d+[.,]\d+)/i);
+    if (krwMatch) {
+        let val = parseFloat(krwMatch[1].replace(',', '.'));
+        rates.KRW = val / 1000;
+    }
+    
+    let aedMatch = text.match(/ОАЭ[^\d]*?(\d+[.,]\d+)/i);
+    if (aedMatch) rates.AED = parseFloat(aedMatch[1].replace(',', '.'));
+    
+    let thbMatch = text.match(/ТАИЛАНД[^\d]*?(\d+[.,]\d+)/i);
+    if (thbMatch) rates.THB = parseFloat(thbMatch[1].replace(',', '.'));
+    
+    // Проверяем, нашли ли хоть что-то
+    if (Object.keys(rates).length === 0) {
+        console.log('⚠️ Не найдено ни одного курса на этой картинке');
+        return null;
     }
     
     return rates;
@@ -54,44 +84,42 @@ function extractRatesFromText(text) {
 // --- Функция для скачивания и распознавания картинки ---
 async function downloadAndRecognizeImage(url) {
     try {
-        console.log('📥 Скачиваем картинку:', url);
+        console.log('📥 Скачиваем картинку...');
         const response = await axios.get(url, { 
             responseType: 'arraybuffer',
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            },
+            timeout: 10000
         });
         
-        // Сохраняем временный файл
         const tempFile = '/tmp/telegram_image.jpg';
         fs.writeFileSync(tempFile, response.data);
-        console.log('✅ Картинка сохранена');
         
-        // Распознаём текст через Tesseract
-        console.log('🔍 Распознаём текст...');
+        console.log('🔍 Распознаём текст через OCR...');
         const result = await Tesseract.recognize(tempFile, 'rus+eng', {
             logger: (m) => {
-                if (m.status === 'recognizing text') {
+                if (m.status === 'recognizing text' && m.progress) {
                     console.log(`⏳ Распознавание: ${Math.round(m.progress * 100)}%`);
                 }
             }
         });
         
-        fs.unlinkSync(tempFile); // Удаляем временный файл
+        fs.unlinkSync(tempFile);
         return result.data.text;
         
     } catch (error) {
-        console.error('❌ Ошибка при скачивании/распознавании:', error.message);
+        console.error('❌ Ошибка:', error.message);
         return null;
     }
 }
 
 // --- Основная функция ---
 async function fetchAllRates() {
-    console.log('🔄 Загрузка курсов из Telegram через OCR...');
+    console.log('🔄 Загрузка свежих курсов из Telegram...');
     
     try {
-        // 1. Загружаем страницу Telegram
+        // 1. Загружаем страницу
         const response = await fetch('https://t.me/s/LoyaltySwift', {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -99,35 +127,53 @@ async function fetchAllRates() {
         });
         const html = await response.text();
         
-        // 2. Находим ссылки на изображения
-        const imageUrls = [];
-        const regex = /background-image:url\('([^']+\.jpg)'\)/g;
+        // 2. Находим все картинки с их порядком (по дате)
+        const imageData = [];
+        const regex = /background-image:url\('([^']+\.jpg)'\)[^}]*?padding-top:([\d.]+)%/g;
         let match;
+        let index = 0;
         while ((match = regex.exec(html)) !== null) {
-            imageUrls.push(match[1]);
+            imageData.push({ 
+                url: match[1], 
+                ratio: parseFloat(match[2]),
+                order: index++ // Порядок = свежесть
+            });
         }
         
-        console.log(`🖼️ Найдено ${imageUrls.length} изображений`);
+        console.log(`🖼️ Найдено ${imageData.length} изображений`);
         
-        if (imageUrls.length === 0) {
-            throw new Error('Не найдено изображений с курсами');
+        if (imageData.length === 0) {
+            throw new Error('Не найдено изображений');
         }
         
-        // 3. Берём самую свежую картинку (первую в списке)
-        const latestImage = imageUrls[0];
-        console.log('📸 Берём самую свежую картинку');
+        // 3. Сортируем: сначала свежие (меньший order), потом по размеру
+        imageData.sort((a, b) => a.order - b.order);
         
-        // 4. Скачиваем и распознаём
-        const recognizedText = await downloadAndRecognizeImage(latestImage);
+        // 4. Пробуем картинки по порядку, пока не найдём курсы
+        let finalRates = null;
         
-        if (!recognizedText) {
-            throw new Error('Не удалось распознать текст');
+        for (let i = 0; i < Math.min(imageData.length, 10); i++) {
+            const img = imageData[i];
+            console.log(`\n📸 Проверяем картинку #${i+1} (порядок: ${img.order})`);
+            
+            const text = await downloadAndRecognizeImage(img.url);
+            if (text) {
+                const rates = extractRatesFromText(text);
+                if (rates) {
+                    console.log('✅ Найдена картинка с курсами!');
+                    finalRates = rates;
+                    break;
+                }
+            }
         }
         
-        // 5. Извлекаем курсы из текста
-        let rates = extractRatesFromText(recognizedText);
+        // 5. Если не нашли курсы — используем резерв
+        if (!finalRates) {
+            console.log('⚠️ Не найдена картинка с курсами, используем резервные значения');
+            finalRates = {};
+        }
         
-        // 6. Заполняем пропуски резервными значениями
+        // 6. Резервные значения (актуальные на сегодня)
         const fallback = {
             USD: 87.60,
             USD_IDUBID: 89.00,
@@ -142,14 +188,14 @@ async function fetchAllRates() {
         };
         
         for (const key of Object.keys(fallback)) {
-            if (!rates[key] || rates[key] === undefined || isNaN(rates[key])) {
-                rates[key] = fallback[key];
+            if (!finalRates[key] || finalRates[key] === undefined || isNaN(finalRates[key]) || finalRates[key] === 0) {
+                finalRates[key] = fallback[key];
                 console.log(`⚠️ ${key} не найден, используем резерв: ${fallback[key]}`);
             }
         }
         
-        console.log('✅ Итоговые курсы:', rates);
-        return rates;
+        console.log('\n✅ Итоговые курсы:', finalRates);
+        return finalRates;
         
     } catch (error) {
         console.error('❌ Ошибка:', error.message);
@@ -182,12 +228,12 @@ app.get('/api/rates', async (req, res) => {
 app.get('/', (req, res) => {
     res.send(`
         <h1>🚀 Сервер с OCR работает!</h1>
-        <p>Курсы распознаются из картинок в Telegram</p>
+        <p>Автоматически находит самую свежую картинку с курсами</p>
         <p><a href="/api/rates">/api/rates</a> - получить курсы</p>
     `);
 });
 
 app.listen(PORT, () => {
     console.log(`🚀 Сервер запущен на порту ${PORT}`);
-    console.log('📸 Используется OCR для распознавания картинок');
+    console.log('📸 Автоматический поиск свежих картинок с курсами');
 });
