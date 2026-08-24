@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const Tesseract = require('tesseract.js');
 const axios = require('axios');
-const fs = require('fs');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,9 +11,9 @@ app.use(express.json());
 
 let cachedRates = null;
 let lastFetch = 0;
-const CACHE_TTL = 2 * 60 * 1000; // 2 минуты
+const CACHE_TTL = 2 * 60 * 1000;
 
-// --- Функция для извлечения курсов (под формат OCR) ---
+// --- Функция для извлечения курсов ---
 function extractRatesFromText(text) {
     console.log('📄 Распознанный текст:');
     console.log(text);
@@ -22,30 +21,14 @@ function extractRatesFromText(text) {
     
     const rates = {};
     
-    // --- Ищем курсы в том формате, который выдал OCR ---
-    
-    // 1. USD (из "150 = 87.20" или "USD = 87.20")
-    let usdMatch = text.match(/(?:USD|150)\s*=\s*(\d+[.,]\d+)/i);
+    // 1. USD: ищем "150 = 87.20" или "USD = 87.20"
+    let usdMatch = text.match(/(?:150|USD)\s*=\s*(\d+[.,]\d+)/i);
     if (usdMatch) {
         rates.USD = parseFloat(usdMatch[1].replace(',', '.'));
         console.log(`✅ USD: ${rates.USD}`);
     }
     
-    // 2. USD_IDUBID (из "IDUBID")
-    let idubidMatch = text.match(/IDUBID[^\d]*(\d+[.,]\d+)/i);
-    if (idubidMatch) {
-        rates.USD_IDUBID = parseFloat(idubidMatch[1].replace(',', '.'));
-        console.log(`✅ USD_IDUBID: ${rates.USD_IDUBID}`);
-    }
-    
-    // 3. CNY (из "КИТАЙ")
-    let cnyMatch = text.match(/КИТАЙ[^\d]*(\d+[.,]\d+)/i);
-    if (cnyMatch) {
-        rates.CNY = parseFloat(cnyMatch[1].replace(',', '.'));
-        console.log(`✅ CNY: ${rates.CNY}`);
-    }
-    
-    // 4. JPY (из "100 JPY = 55.30" или "100 JY = 55.30")
+    // 2. JPY: ищем "100 JPY = 55.30"
     let jpyMatch = text.match(/100\s*(?:JPY|JY)\s*=\s*(\d+[.,]\d+)/i);
     if (jpyMatch) {
         let val = parseFloat(jpyMatch[1].replace(',', '.'));
@@ -54,90 +37,106 @@ function extractRatesFromText(text) {
         console.log(`✅ JPY: ${rates.JPY} (из ${val} за 100 JPY)`);
     }
     
-    // 5. JPY_AFA (из "1JpY=6580" или "AFA")
-    let afaMatch = text.match(/(?:AFA|1JpY)\s*=\s*(\d+[.,]\d+)/i);
+    // 3. JPY_AFA: ищем "1JpY=6580"
+    let afaMatch = text.match(/1JpY\s*=\s*(\d+)/i);
     if (afaMatch) {
         let val = parseFloat(afaMatch[1].replace(',', '.'));
-        rates.JPY_AFA = val / 100;
-        console.log(`✅ JPY_AFA: ${rates.JPY_AFA} (из ${val})`);
+        rates.JPY_AFA = val > 10 ? val / 100 : val;
+        console.log(`✅ JPY_AFA: ${rates.JPY_AFA}`);
     }
     
-    // 6. JPY_QR (из "1JpY = 55.30")
+    // 4. JPY_QR
     let qrMatch = text.match(/1JpY\s*=\s*(\d+[.,]\d+)/i);
     if (qrMatch && !afaMatch) {
         let val = parseFloat(qrMatch[1].replace(',', '.'));
-        rates.JPY_QR = val / 100;
-        console.log(`✅ JPY_QR: ${rates.JPY_QR} (из ${val})`);
+        rates.JPY_QR = val > 10 ? val / 100 : val;
+        console.log(`✅ JPY_QR: ${rates.JPY_QR}`);
     } else if (jpyMatch) {
-        // Если не нашли отдельно, берём из основного JPY
         rates.JPY_QR = rates.JPY;
         console.log(`✅ JPY_QR: ${rates.JPY_QR} (из основного JPY)`);
     }
     
-    // 7. KRW (из "1000 KRW = 63.60")
+    // 5. KRW: ищем "1000 KRW = 63.60"
     let krwMatch = text.match(/1000\s*KRW\s*=\s*(\d+[.,]\d+)/i);
     if (krwMatch) {
         let val = parseFloat(krwMatch[1].replace(',', '.'));
         rates.KRW = val / 1000;
-        console.log(`✅ KRW: ${rates.KRW} (из ${val} за 1000 KRW)`);
+        console.log(`✅ KRW: ${rates.KRW}`);
     }
     
-    // 8. AED (из "1AED = 23.50")
+    // 6. AED: ищем "1AED = 23.50"
     let aedMatch = text.match(/1AED\s*=\s*(\d+[.,]\d+)/i);
     if (aedMatch) {
         rates.AED = parseFloat(aedMatch[1].replace(',', '.'));
         console.log(`✅ AED: ${rates.AED}`);
     }
     
-    // 9. THB (из "1THB = 270" или "1THB = 2.70")
-    let thbMatch = text.match(/1THB\s*=\s*(\d+[.,]\d+)/i);
+    // 7. THB: ищем "1THB = 270"
+    let thbMatch = text.match(/1THB\s*=\s*(\d+)/i);
     if (thbMatch) {
         let val = parseFloat(thbMatch[1].replace(',', '.'));
-        // Если число 270, значит это 2.70 (OCR ошибся)
-        if (val > 100) val = val / 100;
-        rates.THB = val;
+        rates.THB = val > 100 ? val / 100 : val;
         console.log(`✅ THB: ${rates.THB}`);
     }
     
-    // --- Если какие-то курсы не нашлись, используем то, что распознал OCR ---
+    // 8. CNY: ищем "КИТАЙ" и число
+    let cnyMatch = text.match(/КИТАЙ[^\d]*(\d+[.,]\d+)/i);
+    if (cnyMatch) {
+        rates.CNY = parseFloat(cnyMatch[1].replace(',', '.'));
+        console.log(`✅ CNY: ${rates.CNY}`);
+    }
+    
+    // 9. USD_IDUBID
+    let idubidMatch = text.match(/IDUBID[^\d]*(\d+[.,]\d+)/i);
+    if (idubidMatch) {
+        rates.USD_IDUBID = parseFloat(idubidMatch[1].replace(',', '.'));
+        console.log(`✅ USD_IDUBID: ${rates.USD_IDUBID}`);
+    } else if (rates.USD) {
+        rates.USD_IDUBID = rates.USD + 1.5;
+        console.log(`✅ USD_IDUBID: ${rates.USD_IDUBID} (USD + 1.5)`);
+    }
+    
     console.log(`📊 Найдено курсов: ${Object.keys(rates).length}`);
     return rates;
 }
 
-// --- Функция для скачивания и распознавания картинки ---
-async function downloadAndRecognizeImage(url) {
+// --- Функция для распознавания картинки через Buffer ---
+async function recognizeImageFromUrl(url) {
     try {
         console.log('📥 Скачиваем картинку...');
-        const response = await axios.get(url, { 
+        const response = await axios.get(url, {
             responseType: 'arraybuffer',
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             },
             timeout: 15000
         });
-        
-        const tempFile = '/tmp/telegram_image.jpg';
-        fs.writeFileSync(tempFile, response.data);
-        
+
+        console.log('✅ Картинка скачана, размер:', response.data.length, 'байт');
         console.log('🔍 Распознаём текст через OCR...');
-        const result = await Tesseract.recognize(tempFile, 'rus+eng', {
-            logger: (m) => {
-                if (m.status === 'recognizing text' && m.progress) {
-                    console.log(`⏳ Распознавание: ${Math.round(m.progress * 100)}%`);
+
+        // Передаём Buffer напрямую в Tesseract (без сохранения в файл)
+        const result = await Tesseract.recognize(
+            Buffer.from(response.data),
+            'rus+eng',
+            {
+                logger: (m) => {
+                    if (m.status === 'recognizing text' && m.progress) {
+                        console.log(`⏳ Распознавание: ${Math.round(m.progress * 100)}%`);
+                    }
                 }
             }
-        });
-        
-        fs.unlinkSync(tempFile);
+        );
+
         return result.data.text;
-        
+
     } catch (error) {
         console.error('❌ Ошибка при распознавании:', error.message);
         return null;
     }
 }
 
-// --- ГЛАВНАЯ ФУНКЦИЯ: находим САМЫЙ СВЕЖИЙ ПОСТ ---
+// --- ГЛАВНАЯ ФУНКЦИЯ ---
 async function fetchAllRates() {
     console.log('🔄 Поиск самого свежего поста с курсами...');
     
@@ -201,13 +200,11 @@ app.get('/api/rates', async (req, res) => {
         }
         
         const post = await fetchAllRates();
-        const recognizedText = await downloadAndRecognizeImage(post.url);
+        const recognizedText = await recognizeImageFromUrl(post.url);
         
         if (!recognizedText) {
             return res.status(500).json({ 
-                error: 'Не удалось распознать текст с картинки',
-                post: post.id,
-                date: post.date
+                error: 'Не удалось распознать текст с картинки'
             });
         }
         
@@ -216,8 +213,6 @@ app.get('/api/rates', async (req, res) => {
         if (!rates || Object.keys(rates).length === 0) {
             return res.status(500).json({ 
                 error: 'Не найдено курсов на картинке',
-                post: post.id,
-                date: post.date,
                 recognized_text: recognizedText.substring(0, 300)
             });
         }
@@ -230,8 +225,7 @@ app.get('/api/rates', async (req, res) => {
             rates, 
             source: 'ocr',
             post: post.id, 
-            date: post.date,
-            raw_text: recognizedText // для отладки
+            date: post.date
         });
         
     } catch (error) {
@@ -243,11 +237,11 @@ app.get('/api/rates', async (req, res) => {
 app.get('/', (req, res) => {
     res.send(`
         <h1>🚀 OCR Парсер курсов</h1>
-        <p>Распознаёт курсы с картинок Telegram</p>
         <p><a href="/api/rates">/api/rates</a> - получить курсы</p>
     `);
 });
 
 app.listen(PORT, () => {
     console.log(`🚀 Сервер запущен на порту ${PORT}`);
+    console.log('📸 Распознавание через Buffer (без файлов)');
 });
