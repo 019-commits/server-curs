@@ -1,6 +1,6 @@
 {
   "name": "loyaltyswift-rates",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
   "description": "LoyaltySwift Telegram OCR currency parser",
   "main": "server.js",
