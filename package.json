@@ -1,8 +1,8 @@
 {
   "name": "loyaltyswift-rates",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "LoyaltySwift currency rates OCR parser",
+  "description": "LoyaltySwift Telegram OCR currency parser",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,10 +11,10 @@
     "node": "20.x"
   },
   "dependencies": {
-    "axios": "1.7.9",
-    "cors": "2.8.5",
-    "express": "4.21.2",
-    "sharp": "0.33.5",
-    "tesseract.js": "5.1.1"
+    "axios": "^1.11.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "sharp": "^0.33.5",
+    "tesseract.js": "^5.1.1"
   }
 }
