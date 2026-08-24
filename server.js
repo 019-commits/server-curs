@@ -14,9 +14,9 @@ let cachedRates = null;
 let lastFetch = 0;
 const CACHE_TTL = 2 * 60 * 1000; // 2 минуты
 
-// --- Функция для извлечения курсов из распознанного текста ---
+// --- Функция для извлечения курсов ---
 function extractRatesFromText(text) {
-    console.log('📄 Распознанный текст (первые 500 символов):', text.substring(0, 500));
+    console.log('📄 Распознанный текст (первые 300 символов):', text.substring(0, 300));
     
     const rates = {};
     
@@ -72,9 +72,8 @@ function extractRatesFromText(text) {
     let thbMatch = text.match(/ТАИЛАНД[^\d]*?(\d+[.,]\d+)/i);
     if (thbMatch) rates.THB = parseFloat(thbMatch[1].replace(',', '.'));
     
-    // Проверяем, нашли ли хоть что-то
     if (Object.keys(rates).length === 0) {
-        console.log('⚠️ Не найдено ни одного курса на этой картинке');
+        console.log('⚠️ Не найдено ни одного курса');
         return null;
     }
     
@@ -96,7 +95,7 @@ async function downloadAndRecognizeImage(url) {
         const tempFile = '/tmp/telegram_image.jpg';
         fs.writeFileSync(tempFile, response.data);
         
-        console.log('🔍 Распознаём текст через OCR...');
+        console.log('🔍 Распознаём текст...');
         const result = await Tesseract.recognize(tempFile, 'rus+eng', {
             logger: (m) => {
                 if (m.status === 'recognizing text' && m.progress) {
@@ -114,9 +113,9 @@ async function downloadAndRecognizeImage(url) {
     }
 }
 
-// --- Основная функция ---
+// --- ГЛАВНАЯ ФУНКЦИЯ: находим САМЫЙ СВЕЖИЙ ПОСТ с курсами ---
 async function fetchAllRates() {
-    console.log('🔄 Загрузка свежих курсов из Telegram...');
+    console.log('🔄 Поиск самого свежего поста с курсами...');
     
     try {
         // 1. Загружаем страницу
@@ -127,75 +126,67 @@ async function fetchAllRates() {
         });
         const html = await response.text();
         
-        // 2. Находим все картинки с их порядком (по дате)
-        const imageData = [];
-        const regex = /background-image:url\('([^']+\.jpg)'\)[^}]*?padding-top:([\d.]+)%/g;
-        let match;
-        let index = 0;
-        while ((match = regex.exec(html)) !== null) {
-            imageData.push({ 
-                url: match[1], 
-                ratio: parseFloat(match[2]),
-                order: index++ // Порядок = свежесть
-            });
-        }
+        // 2. Находим ВСЕ посты с картинками и датами
+        const posts = [];
+        const postRegex = /<div[^>]*data-post="LoyaltySwift\/(\d+)"[^>]*>([\s\S]*?)<div class="tgme_widget_message_footer/g;
+        let postMatch;
         
-        console.log(`🖼️ Найдено ${imageData.length} изображений`);
-        
-        if (imageData.length === 0) {
-            throw new Error('Не найдено изображений');
-        }
-        
-        // 3. Сортируем: сначала свежие (меньший order), потом по размеру
-        imageData.sort((a, b) => a.order - b.order);
-        
-        // 4. Пробуем картинки по порядку, пока не найдём курсы
-        let finalRates = null;
-        
-        for (let i = 0; i < Math.min(imageData.length, 10); i++) {
-            const img = imageData[i];
-            console.log(`\n📸 Проверяем картинку #${i+1} (порядок: ${img.order})`);
+        while ((postMatch = postRegex.exec(html)) !== null) {
+            const postId = postMatch[1];
+            const content = postMatch[2];
             
-            const text = await downloadAndRecognizeImage(img.url);
-            if (text) {
-                const rates = extractRatesFromText(text);
-                if (rates) {
-                    console.log('✅ Найдена картинка с курсами!');
-                    finalRates = rates;
-                    break;
-                }
+            // Ищем дату в посте (формат: DD.MM)
+            const dateMatch = content.match(/(\d{2}\.\d{2})/);
+            // Ищем картинку
+            const imgMatch = content.match(/background-image:url\('([^']+\.jpg)'\)/);
+            
+            if (dateMatch && imgMatch) {
+                // Проверяем, что это пост с курсами (есть слово "КУРС" или "USD" или "JPY")
+                const hasRates = content.includes('КУРС') || content.includes('USD') || content.includes('JPY');
+                
+                posts.push({
+                    id: postId,
+                    date: dateMatch[1],
+                    url: imgMatch[1],
+                    hasRates: hasRates,
+                    content: content.substring(0, 200) // для лога
+                });
             }
         }
         
-        // 5. Если не нашли курсы — используем резерв
-        if (!finalRates) {
-            console.log('⚠️ Не найдена картинка с курсами, используем резервные значения');
-            finalRates = {};
+        console.log(`📊 Найдено ${posts.length} постов с картинками`);
+        
+        if (posts.length === 0) {
+            throw new Error('Не найдено постов с картинками');
         }
         
-        // 6. Резервные значения (актуальные на сегодня)
-        const fallback = {
-            USD: 87.60,
-            USD_IDUBID: 89.00,
-            CNY: 13.10,
-            JPY: 0.555,
-            JPY_SWIFT: 0.555,
-            JPY_AFA: 0.561,
-            JPY_QR: 0.555,
-            KRW: 0.0637,
-            AED: 23.50,
-            THB: 2.69
-        };
+        // 3. Сортируем посты по ID (чем больше ID, тем свежее пост)
+        posts.sort((a, b) => parseInt(b.id) - parseInt(a.id));
         
-        for (const key of Object.keys(fallback)) {
-            if (!finalRates[key] || finalRates[key] === undefined || isNaN(finalRates[key]) || finalRates[key] === 0) {
-                finalRates[key] = fallback[key];
-                console.log(`⚠️ ${key} не найден, используем резерв: ${fallback[key]}`);
+        // 4. Показываем все найденные посты
+        console.log('\n📋 Найденные посты:');
+        posts.forEach((p, i) => {
+            console.log(`  ${i+1}. Пост #${p.id} от ${p.date} ${p.hasRates ? '✅ с курсами' : '❌ без курсов'}`);
+        });
+        
+        // 5. Ищем САМЫЙ СВЕЖИЙ пост с курсами
+        let targetPost = null;
+        for (const post of posts) {
+            if (post.hasRates) {
+                targetPost = post;
+                break;
             }
         }
         
-        console.log('\n✅ Итоговые курсы:', finalRates);
-        return finalRates;
+        if (!targetPost) {
+            console.log('⚠️ Не найдено постов с курсами, берём самый свежий с картинкой');
+            targetPost = posts[0];
+        }
+        
+        console.log(`\n✅ Выбран пост #${targetPost.id} от ${targetPost.date}`);
+        console.log(`🖼️ URL картинки: ${targetPost.url.substring(0, 80)}...`);
+        
+        return targetPost;
         
     } catch (error) {
         console.error('❌ Ошибка:', error.message);
@@ -211,10 +202,56 @@ app.get('/api/rates', async (req, res) => {
             console.log('📦 Возвращаем кеш');
             return res.json({ rates: cachedRates, source: 'cache' });
         }
-        const rates = await fetchAllRates();
+        
+        // 1. Находим самый свежий пост с курсами
+        const post = await fetchAllRates();
+        
+        // 2. Распознаём текст на картинке
+        const recognizedText = await downloadAndRecognizeImage(post.url);
+        if (!recognizedText) {
+            throw new Error('Не удалось распознать текст');
+        }
+        
+        // 3. Извлекаем курсы
+        let rates = extractRatesFromText(recognizedText);
+        
+        // 4. Резервные значения (из последнего известного поста)
+        const fallback = {
+            USD: 87.60,
+            USD_IDUBID: 89.00,
+            CNY: 13.10,
+            JPY: 0.555,
+            JPY_SWIFT: 0.555,
+            JPY_AFA: 0.561,
+            JPY_QR: 0.555,
+            KRW: 0.0637,
+            AED: 23.50,
+            THB: 2.69
+        };
+        
+        if (!rates) {
+            console.log('⚠️ Не удалось распознать курсы, используем резерв');
+            rates = {};
+        }
+        
+        for (const key of Object.keys(fallback)) {
+            if (!rates[key] || rates[key] === undefined || isNaN(rates[key]) || rates[key] === 0) {
+                rates[key] = fallback[key];
+                console.log(`⚠️ ${key} используем резерв: ${fallback[key]}`);
+            }
+        }
+        
+        console.log('\n✅ Итоговые курсы (пост от ' + post.date + '):', rates);
+        
         cachedRates = rates;
         lastFetch = now;
-        res.json({ rates, source: 'fresh' });
+        res.json({ 
+            rates, 
+            source: 'fresh', 
+            post: post.id, 
+            date: post.date 
+        });
+        
     } catch (error) {
         console.error('❌ Ошибка:', error.message);
         if (cachedRates) {
@@ -227,13 +264,13 @@ app.get('/api/rates', async (req, res) => {
 
 app.get('/', (req, res) => {
     res.send(`
-        <h1>🚀 Сервер с OCR работает!</h1>
-        <p>Автоматически находит самую свежую картинку с курсами</p>
+        <h1>🚀 Парсер свежих курсов</h1>
+        <p>Автоматически находит самый свежий пост с курсами</p>
         <p><a href="/api/rates">/api/rates</a> - получить курсы</p>
     `);
 });
 
 app.listen(PORT, () => {
     console.log(`🚀 Сервер запущен на порту ${PORT}`);
-    console.log('📸 Автоматический поиск свежих картинок с курсами');
+    console.log('📅 Автоматический поиск самого свежего поста с курсами');
 });
