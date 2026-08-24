@@ -1,17 +1,15 @@
-const express = require('express');
-const cors = require('cors');
-const axios = require('axios');
-const Tesseract = require('tesseract.js');
-const sharp = require('sharp');
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios");
+const Tesseract = require("tesseract.js");
+const sharp = require("sharp");
 
 const app = express();
 
 const PORT = process.env.PORT || 3000;
 
-const CHANNEL = 'LoyaltySwift';
-
-const TELEGRAM_URL =
-    `https://t.me/s/${CHANNEL}`;
+const CHANNEL = "LoyaltySwift";
+const TELEGRAM_URL = `https://t.me/s/${CHANNEL}`;
 
 // ============================================================
 // НАСТРОЙКИ
@@ -19,11 +17,16 @@ const TELEGRAM_URL =
 
 const CACHE_TTL = 2 * 60 * 1000;
 
-// Сколько последних постов проверять
-const MAX_POSTS_TO_CHECK = 12;
+// Сколько последних постов разрешаем проверять
+const MAX_POSTS_TO_CHECK = 10;
 
-// После OCR должно быть найдено минимум столько курсов
+// Минимальное количество найденных курсов,
+// чтобы считать картинку рабочей
 const MIN_RATES_REQUIRED = 6;
+
+// Таймауты
+const TELEGRAM_TIMEOUT = 20000;
+const IMAGE_TIMEOUT = 30000;
 
 // ============================================================
 // EXPRESS
@@ -41,10 +44,11 @@ let cachedPost = null;
 let cachedOcrText = null;
 let lastFetch = 0;
 
-let isUpdating = false;
+// Чтобы одновременно не запускать несколько OCR
+let updateInProgress = false;
 
 // ============================================================
-// ЛОГ
+// LOG
 // ============================================================
 
 function log(message, ...args) {
@@ -58,150 +62,193 @@ function log(message, ...args) {
 // ЧИСЛО
 // ============================================================
 
-function parseNumber(value) {
+function toNumber(value) {
     if (value === null || value === undefined) {
         return null;
     }
 
-    let text = String(value)
+    const cleaned = String(value)
         .trim()
-        .replace(/\s/g, '')
-        .replace(',', '.');
+        .replace(/\s/g, "")
+        .replace(",", ".");
 
-    const number = Number(text);
+    const number = Number(cleaned);
 
-    if (!Number.isFinite(number)) {
-        return null;
-    }
-
-    return number;
+    return Number.isFinite(number) ? number : null;
 }
 
 // ============================================================
-// НОРМАЛИЗАЦИЯ КУРСА
+// НОРМАЛИЗАЦИЯ ЧИСЛА
 // ============================================================
 
-function normalizeRate(value) {
-    const number = parseNumber(value);
+function normalizeJPY(value) {
+    let number = toNumber(value);
 
     if (number === null) {
         return null;
     }
 
-    /*
-        OCR иногда видит:
+    // OCR может прочитать:
+    // 1 JPY = 5580
+    //
+    // На картинке фактически:
+    // 1 JPY = 55.80
 
-        1 JPY = 5580
-
-        хотя на картинке:
-
-        1 JPY = 55.80
-
-        Поэтому исправляем такие числа.
-    */
-
-    if (
-        Number.isInteger(number) &&
-        number >= 1000 &&
-        number <= 10000
-    ) {
-        return number / 100;
+    if (number >= 1000 && number <= 10000) {
+        number = number / 100;
     }
 
     return number;
 }
 
 // ============================================================
-// НОРМАЛИЗАЦИЯ OCR
+// НОРМАЛИЗАЦИЯ OCR ТЕКСТА
 // ============================================================
 
 function normalizeOCR(text) {
+    let result = String(text || "");
 
-    return String(text || '')
-        .replace(/\r/g, '\n')
+    // Переносы
+    result = result.replace(/\r/g, "\n");
 
-        // тире
-        .replace(/[–—−]/g, '-')
+    // Типографские символы
+    result = result.replace(/[–—−]/g, "-");
+    result = result.replace(/[，]/g, ",");
 
-        // запятая
-        .replace(/[，]/g, ',')
+    // ========================================================
+    // USD
+    // ========================================================
 
-        // ----------------------------------------------------
-        // USD
-        // ----------------------------------------------------
+    result = result
+        .replace(/\bU5D\b/gi, "USD")
+        .replace(/\bUSO\b/gi, "USD")
+        .replace(/\bUsD\b/g, "USD")
+        .replace(/\bU\$D\b/gi, "USD");
 
-        .replace(/\bU5D\b/gi, 'USD')
-        .replace(/\bUSO\b/gi, 'USD')
-        .replace(/\bUsD\b/g, 'USD')
-        .replace(/\bU5D\b/gi, 'USD')
+    // ========================================================
+    // JPY
+    // ========================================================
 
-        // ----------------------------------------------------
-        // JPY
-        // ----------------------------------------------------
+    result = result
+        .replace(/\bJpY\b/g, "JPY")
+        .replace(/\bJPV\b/gi, "JPY")
+        .replace(/\bJY\b/gi, "JPY")
+        .replace(/\b13PY\b/gi, "JPY")
+        .replace(/\bI3PY\b/gi, "JPY")
+        .replace(/\bIJPY\b/gi, "JPY")
+        .replace(/\bJ3Y\b/gi, "JPY");
 
-        .replace(/\bJPV\b/gi, 'JPY')
-        .replace(/\bJpY\b/gi, 'JPY')
-        .replace(/\bJY\b/gi, 'JPY')
+    // ========================================================
+    // KRW
+    // ========================================================
 
-        // OCR может написать 13PY вместо JPY
-        .replace(/\b13PY\b/gi, 'JPY')
-        .replace(/\bI3PY\b/gi, 'JPY')
-        .replace(/\bJ3Y\b/gi, 'JPY')
-        .replace(/\bIJPY\b/gi, 'JPY')
+    result = result
+        .replace(/\bKRVV\b/gi, "KRW")
+        .replace(/\bKRV\b/gi, "KRW");
 
-        // ----------------------------------------------------
-        // KRW
-        // ----------------------------------------------------
+    // ========================================================
+    // CNY
+    // ========================================================
 
-        .replace(/\bKRVV\b/gi, 'KRW')
-        .replace(/\bKRV\b/gi, 'KRW')
-        .replace(/\bKRW\b/gi, 'KRW')
+    // Очень важный случай из твоего OCR:
+    //
+    // 1eNy = 1315
+    //
+    // Превращаем eNy -> CNY
 
-        // ----------------------------------------------------
-        // CNY
-        // ----------------------------------------------------
+    result = result
+        .replace(/\beNy\b/g, "CNY")
+        .replace(/\bENY\b/g, "CNY")
+        .replace(/\beNY\b/g, "CNY")
+        .replace(/\bCnY\b/g, "CNY")
+        .replace(/\bCNU\b/gi, "CNY")
+        .replace(/\bCNV\b/gi, "CNY");
 
-        .replace(/\bCNU\b/gi, 'CNY')
-        .replace(/\bCNV\b/gi, 'CNY')
-        .replace(/\bCNУ\b/gi, 'CNY')
-        .replace(/\beNy\b/g, 'CNY')
-        .replace(/\bENY\b/g, 'CNY')
-        .replace(/\bCnY\b/g, 'CNY')
+    // Иногда OCR видит первую букву как цифру
+    result = result.replace(/\b1eNy\b/gi, "1 CNY");
+    result = result.replace(/\b1ENY\b/gi, "1 CNY");
 
-        // ----------------------------------------------------
-        // THB
-        // ----------------------------------------------------
+    // ========================================================
+    // THB
+    // ========================================================
 
-        .replace(/\bTH8\b/gi, 'THB')
-        .replace(/\bTHВ\b/gi, 'THB')
-        .replace(/\bTНB\b/gi, 'THB')
-        .replace(/\bтнв\b/gi, 'THB')
-        .replace(/\bтн8\b/gi, 'THB')
+    result = result
+        .replace(/\bTH8\b/gi, "THB")
+        .replace(/\bTHВ\b/gi, "THB")
+        .replace(/\bTНB\b/gi, "THB")
+        .replace(/\bтнв\b/gi, "THB")
+        .replace(/\bтн8\b/gi, "THB");
 
-        // ----------------------------------------------------
-        // AED
-        // ----------------------------------------------------
+    // ========================================================
+    // AED
+    // ========================================================
 
-        .replace(/\bAЕD\b/gi, 'AED')
-        .replace(/\bАЕD\b/gi, 'AED')
-        .replace(/\bАЕр\b/gi, 'AED')
-        .replace(/\bАЕР\b/gi, 'AED')
-        .replace(/\bAЕр\b/gi, 'AED')
-        .replace(/\bAEP\b/gi, 'AED')
+    result = result
+        .replace(/\bAЕD\b/gi, "AED")
+        .replace(/\bАЕD\b/gi, "AED")
+        .replace(/\bАЕр\b/gi, "AED")
+        .replace(/\bАЕР\b/gi, "AED")
+        .replace(/\bAЕр\b/gi, "AED")
+        .replace(/\bAEP\b/gi, "AED");
 
-        // ----------------------------------------------------
-        // IDUBID
-        // ----------------------------------------------------
+    // ========================================================
+    // IDUBID
+    // ========================================================
 
-        .replace(/IDUBlD/gi, 'IDUBID')
-        .replace(/IDUB1D/gi, 'IDUBID')
-        .replace(/IDUBID/gi, 'IDUBID')
+    result = result
+        .replace(/IDUBlD/gi, "IDUBID")
+        .replace(/IDUB1D/gi, "IDUBID")
+        .replace(/IDUBID/gi, "IDUBID");
 
-        // ----------------------------------------------------
-        // пробелы
-        // ----------------------------------------------------
+    // Убираем лишние пробелы
+    result = result
+        .split("\n")
+        .map(line => line.replace(/[ \t]+/g, " ").trim())
+        .join("\n");
 
-        .replace(/[ \t]+/g, ' ');
+    return result;
+}
+
+// ============================================================
+// ПОЛУЧЕНИЕ ЧИСЕЛ ИЗ СТРОКИ
+// ============================================================
+
+function getNumbers(text) {
+    const matches = String(text).match(
+        /\d+(?:[.,]\d+)?/g
+    );
+
+    if (!matches) {
+        return [];
+    }
+
+    return matches
+        .map(toNumber)
+        .filter(v => v !== null);
+}
+
+// ============================================================
+// ПОИСК КУРСА В ОКРЕСТНОСТИ
+// ============================================================
+
+function findRate(text, regex, min, max) {
+    const match = text.match(regex);
+
+    if (!match) {
+        return null;
+    }
+
+    const value = toNumber(match[1]);
+
+    if (value === null) {
+        return null;
+    }
+
+    if (value < min || value > max) {
+        return null;
+    }
+
+    return value;
 }
 
 // ============================================================
@@ -209,15 +256,24 @@ function normalizeOCR(text) {
 // ============================================================
 
 function extractRates(rawText) {
+    const text = normalizeOCR(rawText);
 
-    const normalized = normalizeOCR(rawText);
+    console.log("");
+    console.log("========== NORMALIZED OCR ==========");
+    console.log(text);
+    console.log("====================================");
+    console.log("");
 
-    const lines = normalized
-        .split('\n')
-        .map(line => line.replace(/\s+/g, ' ').trim())
+    const lines = text
+        .split("\n")
+        .map(line => line.trim())
         .filter(Boolean);
 
-    const result = {
+    // ========================================================
+    // РЕЗУЛЬТАТ
+    // ========================================================
+
+    const rates = {
         USD: null,
         USD_IDUBID: null,
 
@@ -235,97 +291,91 @@ function extractRates(rawText) {
     // USD
     // ========================================================
 
-    const usdValues = [];
+    const usdEntries = [];
 
-    for (const line of lines) {
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
 
         const match = line.match(
-            /\b1\s*USD\s*=?\s*(\d{2,3}(?:[.,]\d{1,2})?)/i
+            /\b1?\s*USD\s*=?\s*(\d{2,3}(?:[.,]\d{1,2})?)/i
         );
 
         if (!match) {
             continue;
         }
 
-        const value = parseNumber(match[1]);
+        const value = toNumber(match[1]);
 
         if (
             value !== null &&
             value >= 50 &&
             value <= 150
         ) {
-            usdValues.push({
+            usdEntries.push({
                 value,
+                index: i,
                 line
             });
         }
     }
 
-    // Первый USD = SWIFT
-
-    if (usdValues.length >= 1) {
-        result.USD = usdValues[0].value;
+    // Первый USD
+    if (usdEntries.length > 0) {
+        rates.USD = usdEntries[0].value;
     }
 
-    // IDUBID на той же строке
-
-    for (const item of usdValues) {
-
-        if (/IDUBID/i.test(item.line)) {
-            result.USD_IDUBID = item.value;
+    // Если строка содержит IDUBID
+    for (const entry of usdEntries) {
+        if (/IDUBID/i.test(entry.line)) {
+            rates.USD_IDUBID = entry.value;
         }
     }
 
-    // IDUBID может быть на соседней строке
-
-    if (result.USD_IDUBID === null) {
-
+    // Проверяем несколько строк вокруг IDUBID
+    if (rates.USD_IDUBID === null) {
         for (let i = 0; i < lines.length; i++) {
-
             if (!/IDUBID/i.test(lines[i])) {
                 continue;
             }
 
             for (
-                let j = i;
-                j <= Math.min(i + 3, lines.length - 1);
+                let j = Math.max(0, i - 2);
+                j <= Math.min(lines.length - 1, i + 3);
                 j++
             ) {
-
                 const match = lines[j].match(
-                    /\b1\s*USD\s*=?\s*(\d{2,3}(?:[.,]\d{1,2})?)/i
+                    /\b1?\s*USD\s*=?\s*(\d{2,3}(?:[.,]\d{1,2})?)/i
                 );
 
                 if (!match) {
                     continue;
                 }
 
-                const value = parseNumber(match[1]);
+                const value = toNumber(match[1]);
 
                 if (
                     value !== null &&
                     value >= 50 &&
                     value <= 150
                 ) {
-                    result.USD_IDUBID = value;
+                    rates.USD_IDUBID = value;
                     break;
                 }
             }
 
-            if (result.USD_IDUBID !== null) {
+            if (rates.USD_IDUBID !== null) {
                 break;
             }
         }
     }
 
-    // Если IDUBID потерялся в OCR,
-    // второй USD считаем IDUBID
-
+    // Если найдено два USD
     if (
-        result.USD_IDUBID === null &&
-        usdValues.length >= 2
+        rates.USD_IDUBID === null &&
+        usdEntries.length >= 2
     ) {
-        result.USD_IDUBID = usdValues[1].value;
+        rates.USD_IDUBID =
+            usdEntries[1].value;
     }
 
     // ========================================================
@@ -333,7 +383,6 @@ function extractRates(rawText) {
     // ========================================================
 
     for (const line of lines) {
-
         const match = line.match(
             /1000\s*KRW\s*=?\s*(\d{2,3}(?:[.,]\d{1,2})?)/i
         );
@@ -342,14 +391,14 @@ function extractRates(rawText) {
             continue;
         }
 
-        const value = parseNumber(match[1]);
+        const value = toNumber(match[1]);
 
         if (
             value !== null &&
             value >= 10 &&
             value <= 100
         ) {
-            result.KRW = value;
+            rates.KRW = value;
             break;
         }
     }
@@ -359,67 +408,22 @@ function extractRates(rawText) {
     // ========================================================
 
     for (const line of lines) {
-
         const match = line.match(
-            /\b1\s*AED\s*=?\s*(\d{1,2}(?:[.,]\d{1,2})?)/i
+            /1\s*AED\s*=?\s*(\d{1,2}(?:[.,]\d{1,2})?)/i
         );
 
         if (!match) {
             continue;
         }
 
-        const value = parseNumber(match[1]);
+        const value = toNumber(match[1]);
 
         if (
             value !== null &&
             value >= 5 &&
             value <= 50
         ) {
-            result.AED = value;
-            break;
-        }
-    }
-
-    // ========================================================
-    // CNY
-    // ========================================================
-
-    for (const line of lines) {
-
-        const match = line.match(
-            /\b1\s*CNY\s*=?\s*(\d{1,4}(?:[.,]\d{1,2})?)/i
-        );
-
-        if (!match) {
-            continue;
-        }
-
-        let value = parseNumber(match[1]);
-
-        /*
-            OCR:
-
-            1 CNY = 1315
-
-            На картинке:
-
-            1 CNY = 13.15
-        */
-
-        if (
-            value !== null &&
-            value >= 100 &&
-            value <= 10000
-        ) {
-            value = value / 100;
-        }
-
-        if (
-            value !== null &&
-            value >= 1 &&
-            value <= 30
-        ) {
-            result.CNY = value;
+            rates.AED = value;
             break;
         }
     }
@@ -429,24 +433,120 @@ function extractRates(rawText) {
     // ========================================================
 
     for (const line of lines) {
-
         const match = line.match(
-            /\b1\s*THB\s*=?\s*(\d{1,3}(?:[.,]\d{1,2})?)/i
+            /1\s*THB\s*=?\s*(\d{1,3}(?:[.,]\d{1,2})?)/i
         );
 
         if (!match) {
             continue;
         }
 
-        const value = parseNumber(match[1]);
+        const value = toNumber(match[1]);
 
         if (
             value !== null &&
             value >= 0.1 &&
             value <= 10
         ) {
-            result.THB = value;
+            rates.THB = value;
             break;
+        }
+    }
+
+    // ========================================================
+    // CNY
+    // ========================================================
+
+    /*
+        Основной случай:
+
+        1 CNY = 13.15
+
+        OCR случай:
+
+        1eNy = 1315
+
+        После normalizeOCR:
+
+        1 CNY = 1315
+    */
+
+    for (const line of lines) {
+        const match = line.match(
+            /1\s*CNY\s*=?\s*(\d+(?:[.,]\d+)?)/i
+        );
+
+        if (!match) {
+            continue;
+        }
+
+        let value = toNumber(match[1]);
+
+        if (value === null) {
+            continue;
+        }
+
+        // 1315 -> 13.15
+        if (
+            value >= 100 &&
+            value <= 10000
+        ) {
+            value = value / 100;
+        }
+
+        if (
+            value >= 1 &&
+            value <= 30
+        ) {
+            rates.CNY = value;
+            break;
+        }
+    }
+
+    // Дополнительный CNY fallback
+    if (rates.CNY === null) {
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+
+            if (!/КИТАЙ|CNY/i.test(line)) {
+                continue;
+            }
+
+            // Проверяем текущую и следующие строки
+            for (
+                let j = i;
+                j <= Math.min(i + 2, lines.length - 1);
+                j++
+            ) {
+                const numbers = getNumbers(lines[j]);
+
+                for (const original of numbers) {
+                    let value = original;
+
+                    if (
+                        value >= 100 &&
+                        value <= 10000
+                    ) {
+                        value /= 100;
+                    }
+
+                    if (
+                        value >= 1 &&
+                        value <= 30
+                    ) {
+                        rates.CNY = value;
+                        break;
+                    }
+                }
+
+                if (rates.CNY !== null) {
+                    break;
+                }
+            }
+
+            if (rates.CNY !== null) {
+                break;
+            }
         }
     }
 
@@ -455,250 +555,408 @@ function extractRates(rawText) {
     // ========================================================
 
     for (const line of lines) {
-
         const match = line.match(
-            /\b100\s*JPY\s*=?\s*(\d{2,3}(?:[.,]\d{1,2})?)/i
+            /100\s*JPY\s*=?\s*(\d{2,3}(?:[.,]\d{1,2})?)/i
         );
 
         if (!match) {
             continue;
         }
 
-        const value = parseNumber(match[1]);
+        const value = toNumber(match[1]);
 
         if (
             value !== null &&
             value >= 10 &&
             value <= 100
         ) {
-            result.JPY_SWIFT = value;
+            rates.JPY_SWIFT = value;
             break;
         }
     }
 
     // ========================================================
-    // AFA
+    // JPY AFA
     // ========================================================
 
-    const afaRates = [];
+    /*
+        ВАЖНО.
+
+        На твоей картинке:
+
+        AFA TRADING        AFA TRADING
+
+        1JPY = 5580        13PY = 55.30
+
+        После исправления OCR:
+
+        1JPY = 5580        1JPY = 55.30
+
+        Нужно получить:
+
+        CASH = 55.80
+        QR   = 55.30
+    */
+
+    const afaCandidates = [];
 
     for (let i = 0; i < lines.length; i++) {
-
         const line = lines[i];
 
+        if (!/JPY/i.test(line)) {
+            continue;
+        }
+
         const match = line.match(
-            /\b1\s*JPY\s*=?\s*(\d{2,4}(?:[.,]\d{1,2})?)/i
+            /1\s*JPY\s*=?\s*(\d+(?:[.,]\d+)?)/i
         );
 
         if (!match) {
             continue;
         }
 
-        const value = normalizeRate(match[1]);
+        let value = normalizeJPY(match[1]);
 
         if (
-            value !== null &&
-            value >= 10 &&
-            value <= 100
-        ) {
-            afaRates.push({
-                index: i,
-                value,
-                line
-            });
-        }
-    }
-
-    // ========================================================
-    // Ищем AFA CASH
-    // ========================================================
-
-    for (let i = 0; i < lines.length; i++) {
-
-        if (
-            !/AFA/i.test(lines[i]) &&
-            !/налич/i.test(lines[i]) &&
-            !/cash/i.test(lines[i])
+            value === null ||
+            value < 10 ||
+            value > 100
         ) {
             continue;
         }
 
-        for (
-            let j = i;
-            j <= Math.min(i + 3, lines.length - 1);
-            j++
-        ) {
-
-            const match = lines[j].match(
-                /\b1\s*JPY\s*=?\s*(\d{2,4}(?:[.,]\d{1,2})?)/i
-            );
-
-            if (!match) {
-                continue;
-            }
-
-            const value = normalizeRate(match[1]);
-
-            if (
-                value !== null &&
-                value >= 10 &&
-                value <= 100
-            ) {
-                result.JPY_AFA_CASH = value;
-                break;
-            }
-        }
+        afaCandidates.push({
+            index: i,
+            value,
+            line
+        });
     }
 
     // ========================================================
-    // Ищем AFA QR
-    // ========================================================
-
-    for (let i = 0; i < lines.length; i++) {
-
-        if (
-            !/AFA/i.test(lines[i]) &&
-            !/QR/i.test(lines[i])
-        ) {
-            continue;
-        }
-
-        for (
-            let j = i;
-            j <= Math.min(i + 3, lines.length - 1);
-            j++
-        ) {
-
-            const match = lines[j].match(
-                /\b1\s*JPY\s*=?\s*(\d{2,4}(?:[.,]\d{1,2})?)/i
-            );
-
-            if (!match) {
-                continue;
-            }
-
-            const value = normalizeRate(match[1]);
-
-            if (
-                value !== null &&
-                value >= 10 &&
-                value <= 100
-            ) {
-                result.JPY_AFA_QR = value;
-                break;
-            }
-        }
-    }
-
-    // ========================================================
-    // FALLBACK AFA
+    // AFA CASH
     // ========================================================
 
     /*
-        Если OCR не увидел слова CASH / QR,
-        но увидел две строки:
+        Ищем слово AFA + ближайший JPY.
+    */
 
-        1 JPY = 55.80
-        1 JPY = 55.30
+    let cashIndex = -1;
 
-        используем их как CASH / QR.
+    for (let i = 0; i < lines.length; i++) {
+        if (
+            /AFA/i.test(lines[i]) &&
+            !/QR/i.test(lines[i])
+        ) {
+            cashIndex = i;
+            break;
+        }
+    }
+
+    if (cashIndex !== -1) {
+        for (const candidate of afaCandidates) {
+            if (
+                candidate.index >= cashIndex &&
+                candidate.index <= cashIndex + 3
+            ) {
+                rates.JPY_AFA_CASH =
+                    candidate.value;
+                break;
+            }
+        }
+    }
+
+    // ========================================================
+    // AFA QR
+    // ========================================================
+
+    /*
+        Ищем QR отдельно.
+    */
+
+    let qrIndex = -1;
+
+    for (let i = 0; i < lines.length; i++) {
+        if (/QR/i.test(lines[i])) {
+            qrIndex = i;
+            break;
+        }
+    }
+
+    if (qrIndex !== -1) {
+        for (const candidate of afaCandidates) {
+            if (
+                candidate.index >= qrIndex &&
+                candidate.index <= qrIndex + 3
+            ) {
+                rates.JPY_AFA_QR =
+                    candidate.value;
+                break;
+            }
+        }
+    }
+
+    // ========================================================
+    // ЕСЛИ OCR НЕ УВИДЕЛ QR
+    // ========================================================
+
+    /*
+        Используем расположение кандидатов.
+
+        В нормальной картинке AFA идут:
+
+        55.80
+        55.30
+
+        Поэтому второй кандидат = QR.
     */
 
     if (
-        result.JPY_AFA_CASH === null &&
-        afaRates.length >= 1
+        rates.JPY_AFA_CASH === null &&
+        afaCandidates.length >= 1
     ) {
-        result.JPY_AFA_CASH =
-            afaRates[0].value;
+        rates.JPY_AFA_CASH =
+            afaCandidates[0].value;
     }
 
     if (
-        result.JPY_AFA_QR === null &&
-        afaRates.length >= 2
+        rates.JPY_AFA_QR === null &&
+        afaCandidates.length >= 2
     ) {
-        result.JPY_AFA_QR =
-            afaRates[1].value;
+        /*
+            Если CASH уже найден как первый,
+            QR должен быть следующим курсом.
+        */
+
+        if (
+            rates.JPY_AFA_CASH !== null
+        ) {
+            for (
+                const candidate of afaCandidates
+            ) {
+                if (
+                    candidate.value !==
+                    rates.JPY_AFA_CASH
+                ) {
+                    rates.JPY_AFA_QR =
+                        candidate.value;
+                    break;
+                }
+            }
+        } else {
+            rates.JPY_AFA_QR =
+                afaCandidates[1].value;
+        }
     }
 
     // ========================================================
-    // ФИНАЛЬНЫЙ ЛОГ
+    // ЕСЛИ QR И CASH ОДИНАКОВЫЕ
     // ========================================================
 
-    const found = Object.values(result)
-        .filter(value => value !== null)
-        .length;
+    /*
+        В твоём предыдущем результате:
 
-    log('💰 Результат OCR:', JSON.stringify(result, null, 2));
+        CASH = 55.8
+        QR   = 55.8
 
-    log(
-        `📊 Найдено курсов: ${found}/9`
+        Хотя в OCR были:
+
+        55.80
+        55.30
+
+        Поэтому если найдено два разных JPY,
+        обязательно используем второй для QR.
+    */
+
+    if (
+        rates.JPY_AFA_CASH !== null &&
+        rates.JPY_AFA_QR ===
+            rates.JPY_AFA_CASH &&
+        afaCandidates.length >= 2
+    ) {
+        const second =
+            afaCandidates.find(
+                candidate =>
+                    candidate.value !==
+                    rates.JPY_AFA_CASH
+            );
+
+        if (second) {
+            rates.JPY_AFA_QR =
+                second.value;
+        }
+    }
+
+    // ========================================================
+    // ФИНАЛ
+    // ========================================================
+
+    const count =
+        Object.values(rates)
+            .filter(
+                value =>
+                    value !== null &&
+                    Number.isFinite(value)
+            )
+            .length;
+
+    console.log("");
+    console.log(
+        "💰 РЕЗУЛЬТАТ OCR:"
     );
 
-    return result;
-}
-
-// ============================================================
-// ОЦЕНКА РЕЗУЛЬТАТА
-// ============================================================
-
-function countRates(rates) {
-
-    if (!rates) {
-        return 0;
-    }
-
-    return Object.values(rates)
-        .filter(value =>
-            value !== null &&
-            Number.isFinite(value)
+    console.log(
+        JSON.stringify(
+            rates,
+            null,
+            2
         )
-        .length;
+    );
+
+    console.log(
+        `📊 Найдено курсов: ${count}/9`
+    );
+
+    return rates;
 }
 
 // ============================================================
 // ПРОВЕРКА КУРСОВ
 // ============================================================
 
-function validateRates(rates) {
+function countRates(rates) {
+    if (!rates) {
+        return 0;
+    }
 
+    return Object.values(rates)
+        .filter(
+            value =>
+                value !== null &&
+                Number.isFinite(value)
+        )
+        .length;
+}
+
+// ============================================================
+// ПРОВЕРКА РЕАЛЬНОСТИ КУРСОВ
+// ============================================================
+
+function validateRates(rates) {
     if (!rates) {
         return false;
     }
 
-    const count = countRates(rates);
+    if (
+        rates.USD !== null &&
+        (rates.USD < 50 || rates.USD > 150)
+    ) {
+        return false;
+    }
 
-    /*
-        Для твоей картинки ожидается 9 значений.
+    if (
+        rates.USD_IDUBID !== null &&
+        (
+            rates.USD_IDUBID < 50 ||
+            rates.USD_IDUBID > 150
+        )
+    ) {
+        return false;
+    }
 
-        Но если какой-то элемент OCR не увидит,
-        пост всё равно может быть принят при 6.
-    */
+    if (
+        rates.JPY_SWIFT !== null &&
+        (
+            rates.JPY_SWIFT < 10 ||
+            rates.JPY_SWIFT > 100
+        )
+    ) {
+        return false;
+    }
 
-    return count >= MIN_RATES_REQUIRED;
+    if (
+        rates.JPY_AFA_CASH !== null &&
+        (
+            rates.JPY_AFA_CASH < 10 ||
+            rates.JPY_AFA_CASH > 100
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        rates.JPY_AFA_QR !== null &&
+        (
+            rates.JPY_AFA_QR < 10 ||
+            rates.JPY_AFA_QR > 100
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        rates.KRW !== null &&
+        (
+            rates.KRW < 10 ||
+            rates.KRW > 100
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        rates.AED !== null &&
+        (
+            rates.AED < 5 ||
+            rates.AED > 50
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        rates.CNY !== null &&
+        (
+            rates.CNY < 1 ||
+            rates.CNY > 30
+        )
+    ) {
+        return false;
+    }
+
+    if (
+        rates.THB !== null &&
+        (
+            rates.THB < 0.1 ||
+            rates.THB > 10
+        )
+    ) {
+        return false;
+    }
+
+    return countRates(rates) >= MIN_RATES_REQUIRED;
 }
 
 // ============================================================
-// ПОЛУЧЕНИЕ HTML TELEGRAM
+// TELEGRAM
 // ============================================================
 
-async function getTelegramPage() {
-
-    log('🌐 Загружаем Telegram...');
+async function getTelegramHTML() {
+    log("🌐 Загружаем Telegram...");
 
     const response = await axios.get(
         TELEGRAM_URL,
         {
-            timeout: 20000,
-            responseType: 'text',
+            timeout: TELEGRAM_TIMEOUT,
+            responseType: "text",
             headers: {
-                'User-Agent':
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36',
+                "User-Agent":
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
 
-                'Accept':
-                    'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                "Accept":
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
 
-                'Accept-Language':
-                    'ru-RU,ru;q=0.9,en;q=0.8'
+                "Accept-Language":
+                    "ru-RU,ru;q=0.9,en;q=0.8"
             }
         }
     );
@@ -707,50 +965,34 @@ async function getTelegramPage() {
 }
 
 // ============================================================
-// ПОИСК ПОСТОВ
+// ИЗВЛЕЧЕНИЕ ПОСТОВ
 // ============================================================
 
 function extractPosts(html) {
-
     const posts = [];
-
-    /*
-        Telegram public channel:
-
-        data-post="LoyaltySwift/1340"
-    */
-
-    const postRegex =
-        /data-post=["']LoyaltySwift\/(\d+)["'][\s\S]*?<\/div>\s*<\/div>/gi;
-
-    /*
-        Более надёжно ищем все data-post отдельно.
-    */
-
-    const ids = [];
 
     const idRegex =
         /data-post=["']LoyaltySwift\/(\d+)["']/gi;
 
-    let idMatch;
+    const matches = [];
+
+    let match;
 
     while (
-        (idMatch = idRegex.exec(html)) !== null
+        (match = idRegex.exec(html)) !== null
     ) {
+        const id = Number(match[1]);
 
-        const id = Number(idMatch[1]);
-
-        if (!ids.includes(id)) {
-            ids.push(id);
+        if (!matches.includes(id)) {
+            matches.push(id);
         }
     }
 
-    /*
-        Для каждого ID ищем область рядом с ним.
-    */
+    log(
+        `🔎 Telegram ID найдено: ${matches.length}`
+    );
 
-    for (const id of ids) {
-
+    for (const id of matches) {
         const marker =
             `LoyaltySwift/${id}`;
 
@@ -761,118 +1003,107 @@ function extractPosts(html) {
             continue;
         }
 
-        /*
-            Берём большой кусок HTML после поста.
-            Этого достаточно, чтобы найти фото.
-        */
-
+        // Берём достаточно большой блок
         const block =
             html.substring(
-                position,
-                position + 15000
+                Math.max(0, position - 3000),
+                Math.min(
+                    html.length,
+                    position + 25000
+                )
             );
 
-        // ----------------------------------------------------
+        // ====================================================
         // IMAGE
-        // ----------------------------------------------------
+        // ====================================================
 
         let imageUrl = null;
 
-        /*
-            Telegram часто отдаёт:
-
-            background-image:url('...')
-        */
-
-        let imageMatch =
+        const bgMatch =
             block.match(
-                /background-image\s*:\s*url\(["']?([^"')]+)["']?\)/i
+                /background-image\s*:\s*url\(\s*["']?([^"')]+)["']?\s*\)/i
             );
 
-        if (imageMatch) {
-            imageUrl = imageMatch[1];
+        if (bgMatch) {
+            imageUrl = bgMatch[1];
         }
 
-        /*
-            Иногда встречается просто src.
-        */
-
+        // Другой вариант Telegram
         if (!imageUrl) {
-
-            imageMatch =
+            const imgMatch =
                 block.match(
                     /<img[^>]+src=["']([^"']+)["']/i
                 );
 
-            if (imageMatch) {
-                imageUrl = imageMatch[1];
+            if (imgMatch) {
+                imageUrl = imgMatch[1];
             }
         }
 
-        /*
-            Иногда URL экранирован.
-        */
-
         if (imageUrl) {
-
-            imageUrl =
-                imageUrl
-                    .replace(/&amp;/g, '&')
-                    .replace(/\\u0026/g, '&')
-                    .replace(/\\\//g, '/');
+            imageUrl = imageUrl
+                .replace(/&amp;/g, "&")
+                .replace(/\\u0026/g, "&")
+                .replace(/\\\//g, "/");
         }
 
-        // ----------------------------------------------------
-        // ТЕКСТ ПОСТА
-        // ----------------------------------------------------
+        if (!imageUrl) {
+            continue;
+        }
 
-        const cleanText =
+        // ====================================================
+        // TEXT
+        // ====================================================
+
+        const text =
             block
-                .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-                .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-                .replace(/<[^>]+>/g, ' ')
-                .replace(/&nbsp;/gi, ' ')
-                .replace(/&amp;/gi, '&')
-                .replace(/\s+/g, ' ')
+                .replace(
+                    /<script[\s\S]*?<\/script>/gi,
+                    " "
+                )
+                .replace(
+                    /<style[\s\S]*?<\/style>/gi,
+                    " "
+                )
+                .replace(
+                    /<[^>]+>/g,
+                    " "
+                )
+                .replace(
+                    /&nbsp;/gi,
+                    " "
+                )
+                .replace(
+                    /&amp;/gi,
+                    "&"
+                )
+                .replace(
+                    /\s+/g,
+                    " "
+                )
                 .trim();
-
-        const hasRateKeywords =
-            /КУРС|USD|JPY|KRW|AED|CNY|THB|SWIFT|AFA|IDUBID/i
-                .test(cleanText);
 
         posts.push({
             id,
             imageUrl,
-            text: cleanText,
-            hasRateKeywords
+            text
         });
     }
 
-    /*
-        Убираем дубликаты.
-    */
-
+    // Убираем дубли
     const unique = [];
-
     const used = new Set();
 
     for (const post of posts) {
-
         if (used.has(post.id)) {
             continue;
         }
 
         used.add(post.id);
-
-        if (post.imageUrl) {
-            unique.push(post);
-        }
+        unique.push(post);
     }
 
-    /*
-        Самый большой ID = самый новый пост.
-    */
-
+    // Самый новый первым
     unique.sort(
         (a, b) => b.id - a.id
     );
@@ -881,32 +1112,38 @@ function extractPosts(html) {
 }
 
 // ============================================================
-// ПОЛУЧИТЬ ПОСЛЕДНИЕ ПОСТЫ
+// ПОСЛЕДНИЕ ПОСТЫ
 // ============================================================
 
 async function getLatestPosts() {
-
     const html =
-        await getTelegramPage();
+        await getTelegramHTML();
 
     const posts =
         extractPosts(html);
 
     log(
-        `📊 Найдено постов с изображениями: ${posts.length}`
+        `📊 Найдено постов с картинками: ${posts.length}`
     );
 
     if (posts.length === 0) {
-
         throw new Error(
-            'Telegram не вернул посты с изображениями'
+            "Не найдено постов с изображениями"
         );
     }
 
-    return posts.slice(
-        0,
-        MAX_POSTS_TO_CHECK
+    const latest =
+        posts.slice(
+            0,
+            MAX_POSTS_TO_CHECK
+        );
+
+    log(
+        "🆕 Последние посты:",
+        latest.map(p => `#${p.id}`).join(", ")
     );
+
+    return latest;
 }
 
 // ============================================================
@@ -914,23 +1151,22 @@ async function getLatestPosts() {
 // ============================================================
 
 async function downloadImage(url) {
-
-    log('📥 Скачиваем картинку...');
+    log("📥 Скачиваем картинку...");
 
     const response =
         await axios.get(
             url,
             {
-                responseType: 'arraybuffer',
-                timeout: 30000,
+                responseType: "arraybuffer",
+                timeout: IMAGE_TIMEOUT,
                 maxContentLength:
                     15 * 1024 * 1024,
                 headers: {
-                    'User-Agent':
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36',
+                    "User-Agent":
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/128 Safari/537.36",
 
-                    'Referer':
-                        'https://t.me/'
+                    Referer:
+                        "https://t.me/"
                 }
             }
         );
@@ -946,50 +1182,43 @@ async function downloadImage(url) {
 }
 
 // ============================================================
-// ПОДГОТОВКА КАРТИНКИ
+// ОБРАБОТКА ИЗОБРАЖЕНИЯ
 // ============================================================
 
 async function prepareImage(buffer) {
-
-    /*
-        OCR работает намного лучше,
-        если заранее:
-
-        - увеличивать изображение
-        - переводить в grayscale
-        - усиливать контраст
-        - немного sharpen
-    */
-
     try {
-
-        const image =
-            sharp(buffer);
-
         const metadata =
-            await image.metadata();
+            await sharp(buffer)
+                .metadata();
 
         log(
-            `🖼 Размер картинки: ${metadata.width}x${metadata.height}`
+            `🖼 Исходное изображение: ${metadata.width}x${metadata.height}`
         );
 
-        let pipeline =
-            image
-                .rotate()
-                .resize({
-                    width: 1800,
-                    withoutEnlargement: false
-                })
-                .grayscale()
-                .normalize()
-                .sharpen();
+        /*
+            Увеличиваем изображение.
 
-        return await pipeline.png().toBuffer();
+            OCR особенно плохо читает мелкие цифры,
+            поэтому увеличиваем до 2200 px.
+        */
+
+        return await sharp(buffer)
+            .rotate()
+            .resize({
+                width: 2200,
+                withoutEnlargement: false
+            })
+            .grayscale()
+            .normalize()
+            .sharpen({
+                sigma: 1.2
+            })
+            .png()
+            .toBuffer();
 
     } catch (error) {
-
         log(
-            `⚠️ Не удалось обработать картинку: ${error.message}`
+            `⚠️ Ошибка обработки изображения: ${error.message}`
         );
 
         return buffer;
@@ -1001,8 +1230,7 @@ async function prepareImage(buffer) {
 // ============================================================
 
 async function recognizeImage(buffer) {
-
-    log('🔍 Запускаем OCR...');
+    log("🔍 Запускаем OCR...");
 
     const prepared =
         await prepareImage(buffer);
@@ -1013,15 +1241,13 @@ async function recognizeImage(buffer) {
     const result =
         await Tesseract.recognize(
             prepared,
-            'rus+eng',
+            "rus+eng",
             {
                 logger: message => {
-
                     if (
                         message.status ===
-                        'recognizing text'
+                        "recognizing text"
                     ) {
-
                         const percent =
                             Math.round(
                                 (message.progress || 0) *
@@ -1041,11 +1267,7 @@ async function recognizeImage(buffer) {
         );
 
     const text =
-        result &&
-        result.data &&
-        result.data.text
-            ? result.data.text
-            : '';
+        result?.data?.text || "";
 
     log(
         `✅ OCR завершён за ${Math.round(
@@ -1053,27 +1275,27 @@ async function recognizeImage(buffer) {
         )} сек`
     );
 
-    log('');
-    log('========== OCR TEXT ==========');
+    console.log("");
+    console.log(
+        "========== OCR TEXT =========="
+    );
     console.log(text);
-    log('================================');
+    console.log(
+        "================================"
+    );
+    console.log("");
 
     return text;
 }
 
 // ============================================================
-// ОБРАБОТКА ОДНОГО ПОСТА
+// ОБРАБОТКА ПОСТА
 // ============================================================
 
 async function processPost(post) {
-
-    log('');
+    log("");
     log(
-        `📌 Проверяем пост #${post.id}`
-    );
-
-    log(
-        `🔗 ${post.imageUrl}`
+        `📌 ПРОВЕРЯЕМ ПОСТ #${post.id}`
     );
 
     const image =
@@ -1104,38 +1326,32 @@ async function processPost(post) {
 }
 
 // ============================================================
-// ПОИСК НОВЫХ КУРСОВ
+// ПОИСК СВЕЖИХ КУРСОВ
 // ============================================================
 
 async function fetchLatestRates() {
-
-    log('');
-    log('==========================================');
-    log('🔄 ПОИСК НОВОГО ПОСТА С КУРСАМИ');
-    log('==========================================');
+    log("");
+    log(
+        "=========================================="
+    );
+    log(
+        "🔄 ПОИСК САМЫХ НОВЫХ КУРСОВ"
+    );
+    log(
+        "=========================================="
+    );
 
     const posts =
         await getLatestPosts();
 
     /*
-        Проверяем новые посты от самого нового
-        к старым.
+        ВАЖНО:
 
-        Поэтому если сегодня появился:
-
-        #1350
-
-        он будет проверен раньше:
-
-        #1349
-        #1348
-        #1347
+        Всегда начинаем с самого нового поста.
     */
 
     for (const post of posts) {
-
         try {
-
             const result =
                 await processPost(post);
 
@@ -1144,18 +1360,17 @@ async function fetchLatestRates() {
                     result.rates
                 )
             ) {
-
-                log('');
+                log("");
                 log(
-                    `🎉 НОВЫЕ КУРСЫ ПОЛУЧЕНЫ!`
+                    "🎉 НОВЫЕ КУРСЫ ПОЛУЧЕНЫ!"
                 );
 
                 log(
-                    `✅ Пост: #${post.id}`
+                    `✅ Пост #${post.id}`
                 );
 
                 log(
-                    `✅ Курсов: ${result.count}/9`
+                    `✅ Курсов ${result.count}/9`
                 );
 
                 return {
@@ -1166,11 +1381,10 @@ async function fetchLatestRates() {
             }
 
             log(
-                `⚠️ Пост #${post.id} не прошёл проверку`
+                `⚠️ Пост #${post.id} не подходит`
             );
 
         } catch (error) {
-
             log(
                 `❌ Ошибка поста #${post.id}: ${error.message}`
             );
@@ -1178,68 +1392,52 @@ async function fetchLatestRates() {
     }
 
     throw new Error(
-        'Не удалось найти пост с корректными курсами'
+        "Не найден подходящий пост с курсами"
     );
 }
 
 // ============================================================
-// ОСНОВНОЕ ОБНОВЛЕНИЕ
+// ОБНОВЛЕНИЕ
 // ============================================================
 
 async function updateRates(force = false) {
-
-    /*
-        Если уже идёт обновление,
-        не запускаем второе одновременно.
-    */
-
-    if (isUpdating) {
-
+    if (updateInProgress) {
         log(
-            '⏳ Обновление уже выполняется'
+            "⏳ Обновление уже выполняется"
         );
 
         return {
             rates: cachedRates,
             post: cachedPost,
-            busy: true
+            source: "busy"
         };
     }
 
     const now =
         Date.now();
 
-    /*
-        CACHE
-    */
-
+    // CACHE
     if (
         !force &&
         cachedRates &&
         now - lastFetch < CACHE_TTL
     ) {
-
         log(
-            '📦 Возвращаем данные из CACHE'
+            "📦 Возвращаем данные из CACHE"
         );
 
         return {
             rates: cachedRates,
             post: cachedPost,
-            source: 'cache'
+            source: "cache"
         };
     }
 
-    isUpdating = true;
+    updateInProgress = true;
 
     try {
-
         const result =
             await fetchLatestRates();
-
-        /*
-            Сохраняем новые курсы
-        */
 
         cachedRates =
             result.rates;
@@ -1256,152 +1454,151 @@ async function updateRates(force = false) {
         return {
             rates: cachedRates,
             post: cachedPost,
-            source: 'ocr'
+            source: "ocr"
         };
 
     } finally {
-
-        isUpdating = false;
+        updateInProgress = false;
     }
 }
 
 // ============================================================
-// API /rates
+// API: /api/rates
 // ============================================================
 
-app.get('/api/rates', async (req, res) => {
+app.get(
+    "/api/rates",
+    async (req, res) => {
+        try {
+            const result =
+                await updateRates(false);
 
-    try {
-
-        const result =
-            await updateRates(false);
-
-        res.json({
-            success: true,
-
-            rates: result.rates,
-
-            post: result.post,
-
-            source:
-                result.source || 'ocr',
-
-            updatedAt:
-                new Date(
-                    lastFetch
-                ).toISOString()
-        });
-
-    } catch (error) {
-
-        log(
-            `❌ /api/rates: ${error.message}`
-        );
-
-        /*
-            Если есть старые рабочие курсы,
-            лучше вернуть их, чем отдавать ошибку.
-        */
-
-        if (cachedRates) {
-
-            return res.json({
+            res.json({
                 success: true,
-                rates: cachedRates,
-                post: cachedPost,
-                source: 'stale-cache',
-                warning: error.message,
+                rates: result.rates,
+                post: result.post,
+                source: result.source,
+                updatedAt:
+                    lastFetch
+                        ? new Date(
+                            lastFetch
+                        ).toISOString()
+                        : null
+            });
+
+        } catch (error) {
+            log(
+                `❌ /api/rates: ${error.message}`
+            );
+
+            // Старые рабочие данные
+            if (cachedRates) {
+                return res.json({
+                    success: true,
+                    rates: cachedRates,
+                    post: cachedPost,
+                    source: "stale-cache",
+                    warning: error.message,
+                    updatedAt:
+                        new Date(
+                            lastFetch
+                        ).toISOString()
+                });
+            }
+
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
+        }
+    }
+);
+
+// ============================================================
+// API: ПРИНУДИТЕЛЬНОЕ ОБНОВЛЕНИЕ
+// ============================================================
+
+app.get(
+    "/api/rates/refresh",
+    async (req, res) => {
+        try {
+            log("");
+            log(
+                "🔄 FORCE REFRESH"
+            );
+
+            const result =
+                await updateRates(true);
+
+            res.json({
+                success: true,
+                rates: result.rates,
+                post: result.post,
+                source: "fresh-ocr",
                 updatedAt:
                     new Date(
                         lastFetch
                     ).toISOString()
             });
+
+        } catch (error) {
+            log(
+                `❌ Refresh: ${error.message}`
+            );
+
+            res.status(500).json({
+                success: false,
+                error: error.message
+            });
         }
-
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
     }
-});
+);
 
 // ============================================================
-// ПРИНУДИТЕЛЬНОЕ ОБНОВЛЕНИЕ
+// API: OCR DEBUG
 // ============================================================
 
-app.get('/api/rates/refresh', async (req, res) => {
-
-    try {
-
-        log('');
-        log(
-            '🔄 ПРИНУДИТЕЛЬНОЕ ОБНОВЛЕНИЕ'
-        );
-
-        const result =
-            await updateRates(true);
-
+app.get(
+    "/api/debug/ocr",
+    (req, res) => {
         res.json({
-            success: true,
-            rates: result.rates,
-            post: result.post,
-            source: 'fresh-ocr',
-            updatedAt:
-                new Date(
-                    lastFetch
-                ).toISOString()
-        });
-
-    } catch (error) {
-
-        log(
-            `❌ Refresh: ${error.message}`
-        );
-
-        res.status(500).json({
-            success: false,
-            error: error.message
+            post: cachedPost,
+            rates: cachedRates,
+            ocr: cachedOcrText
         });
     }
-});
+);
 
 // ============================================================
-// ПОКАЗ OCR
+// HEALTH
 // ============================================================
 
-app.get('/api/debug/ocr', (req, res) => {
-
-    res.json({
-        post: cachedPost,
-        rates: cachedRates,
-        ocr: cachedOcrText
-    });
-});
-
-// ============================================================
-// HEALTH CHECK
-// ============================================================
-
-app.get('/health', (req, res) => {
-
-    res.json({
-        status: 'ok',
-        service: 'LoyaltySwift OCR',
-        channel: CHANNEL,
-        cached: !!cachedRates,
-        post: cachedPost
-    });
-});
+app.get(
+    "/health",
+    (req, res) => {
+        res.json({
+            status: "ok",
+            service: "LoyaltySwift OCR",
+            channel: CHANNEL,
+            cached: !!cachedRates,
+            post: cachedPost,
+            cacheAge:
+                lastFetch
+                    ? Date.now() - lastFetch
+                    : null
+        });
+    }
+);
 
 // ============================================================
-// ГЛАВНАЯ
+// HOME
 // ============================================================
 
-app.get('/', (req, res) => {
-
-    res.send(`
+app.get(
+    "/",
+    (req, res) => {
+        res.send(`
 <!DOCTYPE html>
-
 <html lang="ru">
 
 <head>
@@ -1411,15 +1608,25 @@ app.get('/', (req, res) => {
 <meta name="viewport"
       content="width=device-width, initial-scale=1.0">
 
-<title>LoyaltySwift Rates</title>
+<title>LoyaltySwift OCR</title>
 
 <style>
 
 body {
+    margin: 0;
+    padding: 30px;
+
     background: #07151b;
     color: white;
-    font-family: Arial, sans-serif;
-    padding: 30px;
+
+    font-family:
+        Arial,
+        sans-serif;
+}
+
+.container {
+    max-width: 700px;
+    margin: auto;
 }
 
 h1 {
@@ -1428,16 +1635,35 @@ h1 {
 
 a {
     display: block;
+
     margin: 15px 0;
-    padding: 15px;
+    padding: 18px;
+
     background: #102832;
+
     color: #00d9ff;
+
     text-decoration: none;
-    border-radius: 8px;
+
+    border-radius: 10px;
+
+    font-size: 18px;
 }
 
 a:hover {
-    background: #163a47;
+    background: #163b48;
+}
+
+.info {
+    margin-top: 30px;
+
+    padding: 20px;
+
+    background: #0c2028;
+
+    border-radius: 10px;
+
+    color: #b8d5dd;
 }
 
 </style>
@@ -1446,78 +1672,108 @@ a:hover {
 
 <body>
 
+<div class="container">
+
 <h1>🚀 LoyaltySwift OCR</h1>
 
-<p>Парсер курсов работает.</p>
+<p>
+Сервер парсинга курсов работает.
+</p>
 
 <a href="/api/rates">
-    💰 Получить курсы
+💰 Получить текущие курсы
 </a>
 
 <a href="/api/rates/refresh">
-    🔄 Принудительно обновить
+🔄 Найти самый новый пост
 </a>
 
 <a href="/api/debug/ocr">
-    🔍 Посмотреть OCR
+🔍 Посмотреть последний OCR
 </a>
 
 <a href="/health">
-    ❤️ Health Check
+❤️ Проверить сервер
 </a>
+
+<div class="info">
+
+<b>Канал:</b> @LoyaltySwift<br><br>
+
+<b>OCR:</b> Tesseract.js<br>
+
+<b>Обработка изображения:</b> Sharp<br>
+
+<b>Кэш:</b> 2 минуты
+
+</div>
+
+</div>
 
 </body>
 
 </html>
 `);
-});
+    }
+);
 
 // ============================================================
-// ЗАПУСК
+// START
 // ============================================================
 
 app.listen(
     PORT,
-    '0.0.0.0',
+    "0.0.0.0",
     () => {
-
-        log('');
-        log('==========================================');
-        log('🚀 LOYALTY SWIFT OCR SERVER');
-        log('==========================================');
-
+        log("");
         log(
-            `🌐 Порт: ${PORT}`
+            "=========================================="
+        );
+        log(
+            "🚀 LOYALTY SWIFT OCR SERVER"
+        );
+        log(
+            "=========================================="
         );
 
         log(
-            `📢 Канал: @${CHANNEL}`
+            `🌐 PORT: ${PORT}`
         );
 
         log(
-            `📡 Telegram: ${TELEGRAM_URL}`
+            `📢 CHANNEL: @${CHANNEL}`
         );
 
         log(
-            `🧠 OCR: Tesseract.js rus+eng`
+            `📡 TELEGRAM: ${TELEGRAM_URL}`
         );
 
         log(
-            `🖼 Image preprocessing: Sharp`
+            "🧠 OCR: Tesseract.js rus+eng"
         );
 
         log(
-            `💾 Cache: ${CACHE_TTL / 1000} секунд`
+            "🖼 IMAGE: Sharp preprocessing"
         );
 
         log(
-            `🔎 Проверяем последних постов: ${MAX_POSTS_TO_CHECK}`
+            `💾 CACHE: ${CACHE_TTL / 1000} sec`
         );
 
-        log('');
         log(
-            '✅ Сервер готов'
+            `🔎 POSTS TO CHECK: ${MAX_POSTS_TO_CHECK}`
         );
-        log('==========================================');
+
+        log(
+            "=========================================="
+        );
+
+        log(
+            "✅ SERVER READY"
+        );
+
+        log(
+            "=========================================="
+        );
     }
 );
