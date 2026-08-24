@@ -14,7 +14,7 @@ let cachedRates = null;
 let lastFetch = 0;
 const CACHE_TTL = 2 * 60 * 1000; // 2 минуты
 
-// --- Функция для извлечения курсов из распознанного текста ---
+// --- Функция для извлечения курсов (под формат OCR) ---
 function extractRatesFromText(text) {
     console.log('📄 Распознанный текст:');
     console.log(text);
@@ -22,83 +22,84 @@ function extractRatesFromText(text) {
     
     const rates = {};
     
-    // --- Ищем курсы по точным паттернам ---
+    // --- Ищем курсы в том формате, который выдал OCR ---
     
-    // 1. USD SWIFT
-    let usdMatch = text.match(/USD[^\d]*?(\d+[.,]\d+)/i);
+    // 1. USD (из "150 = 87.20" или "USD = 87.20")
+    let usdMatch = text.match(/(?:USD|150)\s*=\s*(\d+[.,]\d+)/i);
     if (usdMatch) {
         rates.USD = parseFloat(usdMatch[1].replace(',', '.'));
         console.log(`✅ USD: ${rates.USD}`);
     }
     
-    // 2. USD IDUBID
-    let idubidMatch = text.match(/IDUBID[^\d]*?(\d+[.,]\d+)/i);
+    // 2. USD_IDUBID (из "IDUBID")
+    let idubidMatch = text.match(/IDUBID[^\d]*(\d+[.,]\d+)/i);
     if (idubidMatch) {
         rates.USD_IDUBID = parseFloat(idubidMatch[1].replace(',', '.'));
         console.log(`✅ USD_IDUBID: ${rates.USD_IDUBID}`);
     }
     
-    // 3. CNY
-    let cnyMatch = text.match(/КИТАЙ[^\d]*?(\d+[.,]\d+)/i);
+    // 3. CNY (из "КИТАЙ")
+    let cnyMatch = text.match(/КИТАЙ[^\d]*(\d+[.,]\d+)/i);
     if (cnyMatch) {
         rates.CNY = parseFloat(cnyMatch[1].replace(',', '.'));
         console.log(`✅ CNY: ${rates.CNY}`);
     }
     
-    // 4. JPY (внутренний перевод)
-    let jpyMatch = text.match(/ЯПОНИЯ[^\d]*?внутренний[^\d]*?(\d+[.,]\d+)/i);
+    // 4. JPY (из "100 JPY = 55.30" или "100 JY = 55.30")
+    let jpyMatch = text.match(/100\s*(?:JPY|JY)\s*=\s*(\d+[.,]\d+)/i);
     if (jpyMatch) {
         let val = parseFloat(jpyMatch[1].replace(',', '.'));
-        rates.JPY = val > 10 ? val / 100 : val;
-        console.log(`✅ JPY: ${rates.JPY} (из ${val})`);
+        rates.JPY = val / 100;
+        rates.JPY_SWIFT = val / 100;
+        console.log(`✅ JPY: ${rates.JPY} (из ${val} за 100 JPY)`);
     }
     
-    // 5. JPY SWIFT
-    let jpySwiftMatch = text.match(/ЯПОНИЯ[^\d]*?SWIFT[^\d]*?(\d+[.,]\d+)/i);
-    if (jpySwiftMatch) {
-        let val = parseFloat(jpySwiftMatch[1].replace(',', '.'));
-        rates.JPY_SWIFT = val > 10 ? val / 100 : val;
-        console.log(`✅ JPY_SWIFT: ${rates.JPY_SWIFT} (из ${val})`);
-    }
-    
-    // 6. JPY AFA (наличные)
-    let afaMatch = text.match(/AFA[^\d]*?TRADING[^\d]*?наличные[^\d]*?(\d+[.,]\d+)/i);
+    // 5. JPY_AFA (из "1JpY=6580" или "AFA")
+    let afaMatch = text.match(/(?:AFA|1JpY)\s*=\s*(\d+[.,]\d+)/i);
     if (afaMatch) {
         let val = parseFloat(afaMatch[1].replace(',', '.'));
-        rates.JPY_AFA = val > 10 ? val / 100 : val;
+        rates.JPY_AFA = val / 100;
         console.log(`✅ JPY_AFA: ${rates.JPY_AFA} (из ${val})`);
     }
     
-    // 7. JPY AFA (QR)
-    let qrMatch = text.match(/AFA[^\d]*?TRADING[^\d]*?QR[^\d]*?(\d+[.,]\d+)/i);
-    if (qrMatch) {
+    // 6. JPY_QR (из "1JpY = 55.30")
+    let qrMatch = text.match(/1JpY\s*=\s*(\d+[.,]\d+)/i);
+    if (qrMatch && !afaMatch) {
         let val = parseFloat(qrMatch[1].replace(',', '.'));
-        rates.JPY_QR = val > 10 ? val / 100 : val;
+        rates.JPY_QR = val / 100;
         console.log(`✅ JPY_QR: ${rates.JPY_QR} (из ${val})`);
+    } else if (jpyMatch) {
+        // Если не нашли отдельно, берём из основного JPY
+        rates.JPY_QR = rates.JPY;
+        console.log(`✅ JPY_QR: ${rates.JPY_QR} (из основного JPY)`);
     }
     
-    // 8. KRW
-    let krwMatch = text.match(/ЮЖНАЯ[^\d]*?КОРЕЯ[^\d]*?(\d+[.,]\d+)/i);
+    // 7. KRW (из "1000 KRW = 63.60")
+    let krwMatch = text.match(/1000\s*KRW\s*=\s*(\d+[.,]\d+)/i);
     if (krwMatch) {
         let val = parseFloat(krwMatch[1].replace(',', '.'));
-        rates.KRW = val > 10 ? val / 1000 : val;
-        console.log(`✅ KRW: ${rates.KRW} (из ${val})`);
+        rates.KRW = val / 1000;
+        console.log(`✅ KRW: ${rates.KRW} (из ${val} за 1000 KRW)`);
     }
     
-    // 9. AED
-    let aedMatch = text.match(/ОАЭ[^\d]*?(\d+[.,]\d+)/i);
+    // 8. AED (из "1AED = 23.50")
+    let aedMatch = text.match(/1AED\s*=\s*(\d+[.,]\d+)/i);
     if (aedMatch) {
         rates.AED = parseFloat(aedMatch[1].replace(',', '.'));
         console.log(`✅ AED: ${rates.AED}`);
     }
     
-    // 10. THB
-    let thbMatch = text.match(/ТАИЛАНД[^\d]*?(\d+[.,]\d+)/i);
+    // 9. THB (из "1THB = 270" или "1THB = 2.70")
+    let thbMatch = text.match(/1THB\s*=\s*(\d+[.,]\d+)/i);
     if (thbMatch) {
-        rates.THB = parseFloat(thbMatch[1].replace(',', '.'));
+        let val = parseFloat(thbMatch[1].replace(',', '.'));
+        // Если число 270, значит это 2.70 (OCR ошибся)
+        if (val > 100) val = val / 100;
+        rates.THB = val;
         console.log(`✅ THB: ${rates.THB}`);
     }
     
+    // --- Если какие-то курсы не нашлись, используем то, что распознал OCR ---
     console.log(`📊 Найдено курсов: ${Object.keys(rates).length}`);
     return rates;
 }
@@ -136,7 +137,7 @@ async function downloadAndRecognizeImage(url) {
     }
 }
 
-// --- ГЛАВНАЯ ФУНКЦИЯ: находим САМЫЙ СВЕЖИЙ ПОСТ с курсами ---
+// --- ГЛАВНАЯ ФУНКЦИЯ: находим САМЫЙ СВЕЖИЙ ПОСТ ---
 async function fetchAllRates() {
     console.log('🔄 Поиск самого свежего поста с курсами...');
     
@@ -229,7 +230,8 @@ app.get('/api/rates', async (req, res) => {
             rates, 
             source: 'ocr',
             post: post.id, 
-            date: post.date
+            date: post.date,
+            raw_text: recognizedText // для отладки
         });
         
     } catch (error) {
@@ -241,12 +243,11 @@ app.get('/api/rates', async (req, res) => {
 app.get('/', (req, res) => {
     res.send(`
         <h1>🚀 OCR Парсер курсов</h1>
-        <p>Распознаёт курсы ТОЛЬКО с картинок Telegram</p>
+        <p>Распознаёт курсы с картинок Telegram</p>
         <p><a href="/api/rates">/api/rates</a> - получить курсы</p>
     `);
 });
 
 app.listen(PORT, () => {
     console.log(`🚀 Сервер запущен на порту ${PORT}`);
-    console.log('📸 Только OCR, без резервных курсов');
 });
