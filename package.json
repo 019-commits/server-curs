@@ -1,6 +1,7 @@
 {
-  "name": "loyalty-swift-rates",
-  "version": "1.0.0",
+  "name": "loyaltyswift-rates",
+  "version": "2.0.0",
+  "description": "Telegram OCR exchange rates API",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
