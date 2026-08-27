@@ -24,7 +24,7 @@ const CHECK_INTERVAL = 60 * 1000;
 const MAX_POSTS_TO_SCAN = 40;
 
 // Сколько дней назад разрешаем искать
-const MAX_DAYS_BACK = 7;
+const MAX_DAYS_BACK = 1;
 
 // Минимальное количество курсов для принятия результата
 // У нас 10 полей
