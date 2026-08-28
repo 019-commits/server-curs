@@ -1,13 +1,13 @@
 {
   "name": "loyaltyswift-rates",
   "version": "1.0.0",
-  "description": "LoyaltySwift exchange rates OCR parser",
+  "description": "LoyaltySwift Telegram exchange rates OCR server",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20"
   },
   "dependencies": {
     "axios": "^1.11.0",
