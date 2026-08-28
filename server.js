@@ -71,10 +71,30 @@ const RATES_FILE =
     );
 
 // ============================================================
-// EXPRESS
+// EXPRESS + CORS
 // ============================================================
 
-app.use(cors());
+app.use(
+    cors({
+        origin: "*",
+        methods: [
+            "GET",
+            "HEAD",
+            "OPTIONS"
+        ],
+        allowedHeaders: [
+            "Content-Type",
+            "Accept",
+            "Origin"
+        ],
+        optionsSuccessStatus: 204
+    })
+);
+
+app.options(
+    "*",
+    cors()
+);
 
 app.use(
     express.json()
