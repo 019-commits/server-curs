@@ -1,0 +1,22 @@
+{
+  "success": false,
+  "rates": {
+    "USD": null,
+    "USD_IDUBID": null,
+    "JPY_SWIFT": null,
+    "JPY_INTERNAL": null,
+    "JPY_AFA_CASH": null,
+    "JPY_AFA_QR": null,
+    "KRW": null,
+    "AED": null,
+    "CNY": null,
+    "THB": null
+  },
+  "post": null,
+  "postUrl": null,
+  "postDate": null,
+  "source": null,
+  "updatedAt": null,
+  "ocrText": "",
+  "fallback": false
+}
